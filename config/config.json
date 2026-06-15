@@ -1,0 +1,18 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/spfx-build/config.2.0.schema.json",
+  "version": "2.0",
+  "bundles": {
+    "procopio-forms-form-customizer": {
+      "components": [
+        {
+          "entrypoint": "./lib/extensions/procopioForms/ProcopioFormsFormCustomizer.js",
+          "manifest": "./src/extensions/procopioForms/ProcopioFormsFormCustomizer.manifest.json"
+        }
+      ]
+    }
+  },
+  "externals": {},
+  "localizedResources": {
+    "ProcopioFormsFormCustomizerStrings": "lib/extensions/procopioForms/loc/{locale}.js"
+  }
+}
