@@ -1,5 +1,6 @@
 import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import { SPHttpClient, SPHttpClientResponse } from '@microsoft/sp-http';
+import { toDateInput, toSharePointDateOnlyPayload } from '../../../shared/sharePointDateUtils';
 
 export interface IViajeData {
   nombre: string;
@@ -1245,10 +1246,7 @@ export default class SharePointViajesService {
   }
 
   private _toDateInput(value: string): string {
-    if (!value) {
-      return '';
-    }
-    return value.length >= 10 ? value.substr(0, 10) : value;
+    return toDateInput(value);
   }
 
   private _toIsoDateTime(value: string): string {
@@ -1258,15 +1256,8 @@ export default class SharePointViajesService {
     return value + 'T00:00:00Z';
   }
 
-  /**
-   * DateOnly payload for Viaje dates.
-   * Single controlled conversion for save path (no Date object / timezone math).
-   */
   private _toSharePointDateOnlyPayload(value: string): string {
-    if (!value) {
-      return '';
-    }
-    return value + 'T12:00:00Z';
+    return toSharePointDateOnlyPayload(value);
   }
 
   private _toNumber(value: any): number {

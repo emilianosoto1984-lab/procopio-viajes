@@ -6,7 +6,7 @@
     "default": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "ca1bb2bc-13ef-44b4-b5ed-ef580c397771",
+        "componentId": "b62bfb4e-df02-41ec-b826-ba667ec84b7e",
         "PageType": 8,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Viajes",
         "properties": {
@@ -17,7 +17,7 @@
     "procopioForms_NewForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "ca1bb2bc-13ef-44b4-b5ed-ef580c397771",
+        "componentId": "b62bfb4e-df02-41ec-b826-ba667ec84b7e",
         "PageType": 8,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Viajes",
         "properties": {
@@ -28,7 +28,7 @@
     "procopioForms_EditForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "ca1bb2bc-13ef-44b4-b5ed-ef580c397771",
+        "componentId": "b62bfb4e-df02-41ec-b826-ba667ec84b7e",
         "PageType": 6,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Viajes",
         "ID": 1,
@@ -40,7 +40,7 @@
     "procopioForms_ViewForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "ca1bb2bc-13ef-44b4-b5ed-ef580c397771",
+        "componentId": "b62bfb4e-df02-41ec-b826-ba667ec84b7e",
         "PageType": 4,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Viajes",
         "ID": 1,
@@ -52,7 +52,7 @@
     "registroPagosForm_NewForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "1afd244d-d836-4d82-94de-2837cecdeafd",
+        "componentId": "02249e62-9268-4a2f-8c39-077ebb0f918f",
         "PageType": 8,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Pagos",
         "properties": {
@@ -63,7 +63,7 @@
     "registroPagosForm_EditForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "1afd244d-d836-4d82-94de-2837cecdeafd",
+        "componentId": "02249e62-9268-4a2f-8c39-077ebb0f918f",
         "PageType": 6,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Pagos",
         "ID": 1,
@@ -75,7 +75,7 @@
     "registroPagosForm_ViewForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {
-        "componentId": "1afd244d-d836-4d82-94de-2837cecdeafd",
+        "componentId": "02249e62-9268-4a2f-8c39-077ebb0f918f",
         "PageType": 4,
         "RootFolder": "/sites/Dev-Viajes/Lists/Registro%20de%20Pagos",
         "ID": 1,

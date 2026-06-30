@@ -1,9 +1,9 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/spfx-build/package-solution.schema.json",
   "solution": {
-    "name": "procopio-client-side-solution",
-    "id": "2cf3790b-275e-499e-b70f-40d7c344cf84",
-    "version": "1.0.14.0",
+    "name": "procopio-client-side-solution-dev",
+    "id": "cec31400-3a33-4125-a3a9-e0d093ed860b",
+    "version": "1.0.13.0",
     "includeClientSideAssets": true,
     "skipFeatureDeployment": true,
     "isDomainIsolated": false,
@@ -29,12 +29,12 @@
       {
         "title": "procopio Feature",
         "description": "The feature that activates elements of the procopio solution.",
-        "id": "ba7c2228-f919-4b38-83dd-04c14f26638d",
-        "version": "1.0.14.0"
+        "id": "ab196397-736f-4b77-8bfa-5273af4b34e6",
+        "version": "1.0.13.0"
       }
     ]
   },
   "paths": {
-    "zippedPackage": "solution/procopio.sppkg"
+    "zippedPackage": "solution/procopio-dev.sppkg"
   }
 }

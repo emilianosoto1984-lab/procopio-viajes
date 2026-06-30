@@ -9,10 +9,19 @@
           "manifest": "./src/extensions/procopioForms/ProcopioFormsFormCustomizer.manifest.json"
         }
       ]
+    },
+    "registro-pagos-form-form-customizer": {
+      "components": [
+        {
+          "entrypoint": "./lib/extensions/registroPagosForm/RegistroPagosFormFormCustomizer.js",
+          "manifest": "./src/extensions/registroPagosForm/RegistroPagosFormFormCustomizer.manifest.json"
+        }
+      ]
     }
   },
   "externals": {},
   "localizedResources": {
-    "ProcopioFormsFormCustomizerStrings": "lib/extensions/procopioForms/loc/{locale}.js"
+    "ProcopioFormsFormCustomizerStrings": "lib/extensions/procopioForms/loc/{locale}.js",
+    "RegistroPagosFormFormCustomizerStrings": "lib/extensions/registroPagosForm/loc/{locale}.js"
   }
 }
