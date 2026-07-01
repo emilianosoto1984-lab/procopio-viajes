@@ -18,7 +18,7 @@ import SharePointViajesService, {
   IVoucherItem,
   IViajeData
 } from '../services/SharePointViajesService';
-import styles from './ProcopioForms.module.scss';
+import { DatePicker, DayOfWeek, IDatePickerStrings, ITextField } from '@fluentui/react';
 
 export interface IProcopioFormsProps {
   context: FormCustomizerContext;
@@ -28,6 +28,26 @@ export interface IProcopioFormsProps {
 }
 
 const LOG_SOURCE: string = 'ProcopioForms';
+const FECHA_VIAJE_ERROR_MENSAJE = 'La fecha de salida debe ser anterior a la fecha de regreso.';
+const VIAJE_DATE_PICKER_STRINGS: IDatePickerStrings = {
+  months: [
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+  ],
+  shortMonths: ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'],
+  days: ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'],
+  shortDays: ['D', 'L', 'M', 'M', 'J', 'V', 'S'],
+  goToToday: 'Ir a hoy',
+  prevMonthAriaLabel: 'Mes anterior',
+  nextMonthAriaLabel: 'Mes siguiente',
+  prevYearAriaLabel: 'Año anterior',
+  nextYearAriaLabel: 'Año siguiente',
+  closeButtonAriaLabel: 'Cerrar',
+  monthPickerHeaderAriaLabel: '{0}, seleccionar para cambiar el año',
+  yearPickerHeaderAriaLabel: '{0}, seleccionar para cambiar el mes',
+  isRequiredErrorMessage: 'La fecha es obligatoria.',
+  invalidInputErrorMessage: 'Formato de fecha inválido. Use dd/mm/aaaa.'
+};
 const COLORES_VIAJE = ['Azul', 'Rojo', 'Amarillo', 'Verde', 'Violeta', 'Naranja', 'Turquesa', 'Rosa', 'Gris', 'Marrón'] as const;
 const ESTADOS_VIAJE = ['Activo', 'En Viaje', 'Finalizado'] as const;
 type EstadoViaje = typeof ESTADOS_VIAJE[number];
@@ -74,6 +94,8 @@ interface IProcopioFormsState {
   destinoId: number;
   fechaSalida: string;
   fechaRegreso: string;
+  fechaSalidaTexto: string;
+  fechaRegresoTexto: string;
   estado: EstadoViaje;
   colorViaje: string;
   pasajeros: IPasajero[];
@@ -106,7 +128,9 @@ interface IProcopioFormsState {
     cotizacion: string;
     liquidacionOperadorId: string;
     servicioAsociadoId: string;
+    fechaTexto: string;
   };
+  pasajeroFechaNacimientoTexto: string;
   nuevoPasajeroDraft: IPasajeroDraft;
   pasajeroBusquedaTexto: string;
   mostrarEditorPasajero: boolean;
@@ -839,6 +863,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   public constructor(props: IProcopioFormsProps) {
     super(props);
     this._service = new SharePointViajesService(props.context);
+    const fechaMovimientoInicial = this._getTodayDateInput();
     this.state = {
       viajeId: null,
       nombreViaje: '',
@@ -846,6 +871,8 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       destinoId: 0,
       fechaSalida: '',
       fechaRegreso: '',
+      fechaSalidaTexto: '',
+      fechaRegresoTexto: '',
       estado: 'Activo',
       colorViaje: this._getRandomColorViaje(),
       pasajeros: [],
@@ -863,6 +890,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       servicioEnEdicionId: null,
       mostrarEditorServicio: false,
       nuevoPasajeroDraft: { nombreApellido: '', dni: '', pasaporte: '', telefono: '', email: '', observaciones: '', fechaNacimiento: '' },
+      pasajeroFechaNacimientoTexto: '',
       pasajeroBusquedaTexto: '',
       mostrarEditorPasajero: false,
       pasajeroEnEdicionId: null,
@@ -870,7 +898,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       pasajeroDocumentosExpandidoId: null,
       pasajeroDocumentosPorId: {},
       pasajeroDocumentosCargandoId: null,
-      movimientoEnEdicion: { tipo: 'Ingreso', movimiento: '', medioPago: '', fecha: this._getTodayDateInput(), moneda: 'Pesos', monto: '', observaciones: '', cotizacion: '', liquidacionOperadorId: '', servicioAsociadoId: '' },
+      movimientoEnEdicion: {
+        tipo: 'Ingreso',
+        movimiento: '',
+        medioPago: '',
+        fecha: fechaMovimientoInicial,
+        fechaTexto: this._fechaViajeTextoDesdeValor(fechaMovimientoInicial),
+        moneda: 'Pesos',
+        monto: '',
+        observaciones: '',
+        cotizacion: '',
+        liquidacionOperadorId: '',
+        servicioAsociadoId: ''
+      },
       movimientoEnEdicionId: null,
       mostrarEditorMovimiento: false,
       mostrarEditorVoucher: false,
@@ -945,13 +985,17 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           : destinoSeleccionado && destinoSeleccionado.destinoGeneralId
             ? destinoSeleccionado.destinoGeneralId
             : 0;
+        const fechaSalida = this._getDateOnlyFromSharePoint(viaje.fechaSalida);
+        const fechaRegreso = this._getDateOnlyFromSharePoint(viaje.fechaLlegada);
         this.setState({
           viajeId: itemId,
           nombreViaje: viaje.nombre,
           destinoGeneralId,
           destinoId: viaje.destinoId,
-          fechaSalida: this._getDateOnlyFromSharePoint(viaje.fechaSalida),
-          fechaRegreso: this._getDateOnlyFromSharePoint(viaje.fechaLlegada),
+          fechaSalida,
+          fechaRegreso,
+          fechaSalidaTexto: this._fechaViajeTextoDesdeValor(fechaSalida),
+          fechaRegresoTexto: this._fechaViajeTextoDesdeValor(fechaRegreso),
           estado: this._normalizarEstado(viaje.estado),
           colorViaje: viaje.colorViaje || this.state.colorViaje,
           observaciones: viaje.observaciones,
@@ -1069,6 +1113,379 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     return new Date().toISOString().substr(0, 10);
   }
 
+  private _dateToViajeInputString(date: Date): string {
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    const monthStr = month < 10 ? '0' + month : String(month);
+    const dayStr = day < 10 ? '0' + day : String(day);
+    return year + '-' + monthStr + '-' + dayStr;
+  }
+
+  private _parseViajeDateStringToDate(value: string): Date | undefined {
+    const datePart = this._getDateOnlyFromSharePoint(value);
+    const parts = datePart.split('-');
+    if (parts.length !== 3) {
+      return undefined;
+    }
+    const year = Number(parts[0]);
+    const month = Number(parts[1]);
+    const day = Number(parts[2]);
+    if (!year || !month || !day) {
+      return undefined;
+    }
+    const date = new Date(year, month - 1, day);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+      return undefined;
+    }
+    return date;
+  }
+
+  private _formatViajeDateForPicker(date?: Date): string {
+    if (!date) {
+      return '';
+    }
+    const day = date.getDate();
+    const month = date.getMonth() + 1;
+    const dayStr = day < 10 ? '0' + day : String(day);
+    const monthStr = month < 10 ? '0' + month : String(month);
+    return dayStr + '/' + monthStr + '/' + date.getFullYear();
+  }
+
+  private _fechaViajeTextoDesdeValor(value: string): string {
+    const date = this._parseViajeDateStringToDate(value);
+    return date ? this._formatViajeDateForPicker(date) : '';
+  }
+
+  private _aplicarMascaraFechaViaje(value: string): string {
+    const digits = (value || '').replace(/\D/g, '').substring(0, 8);
+    if (digits.length <= 2) {
+      return digits;
+    }
+    if (digits.length <= 4) {
+      return digits.substring(0, 2) + '/' + digits.substring(2);
+    }
+    return digits.substring(0, 2) + '/' + digits.substring(2, 4) + '/' + digits.substring(4);
+  }
+
+  private _parseViajeDateFromPickerString(dateStr: string): Date | null {
+    const trimmed = (dateStr || '').trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parts = trimmed.split('/');
+    if (parts.length !== 3) {
+      return null;
+    }
+    const day = Number(parts[0]);
+    const month = Number(parts[1]);
+    const year = Number(parts[2]);
+    if (!day || !month || !year || parts[2].length < 4) {
+      return null;
+    }
+    const date = new Date(year, month - 1, day);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+      return null;
+    }
+    return date;
+  }
+
+  private _esFechasViajeInvalidas(fechaSalida: string, fechaRegreso: string): boolean {
+    const salida = this._getDateOnlyFromSharePoint(fechaSalida).trim();
+    const llegada = this._getDateOnlyFromSharePoint(fechaRegreso).trim();
+    if (!salida || !llegada) {
+      return false;
+    }
+    return salida >= llegada;
+  }
+
+  private _validarFechasViajeEnCambio(): void {
+    if (this._esFechasViajeInvalidas(this.state.fechaSalida, this.state.fechaRegreso)) {
+      console.log('Validación fechas viaje: FechaSalida debe ser anterior a FechaLlegada');
+      this.setState({ error: FECHA_VIAJE_ERROR_MENSAJE });
+      return;
+    }
+    if (this.state.error === FECHA_VIAJE_ERROR_MENSAJE) {
+      this.setState({ error: '' });
+    }
+  }
+
+  private _validarFechasViaje(): boolean {
+    if (this._esFechasViajeInvalidas(this.state.fechaSalida, this.state.fechaRegreso)) {
+      console.log('Validación fechas viaje: FechaSalida debe ser anterior a FechaLlegada');
+      this.setState({ error: FECHA_VIAJE_ERROR_MENSAJE });
+      return false;
+    }
+    return true;
+  }
+
+  private _onSeleccionarFechaSalida = (date: Date | null | undefined): void => {
+    const fechaSalida = date ? this._dateToViajeInputString(date) : '';
+    const fechaSalidaTexto = date ? this._formatViajeDateForPicker(date) : '';
+    this.setState({ fechaSalida, fechaSalidaTexto }, () => {
+      this._validarFechasViajeEnCambio();
+    });
+  };
+
+  private _onSeleccionarFechaRegreso = (date: Date | null | undefined): void => {
+    const fechaRegreso = date ? this._dateToViajeInputString(date) : '';
+    const fechaRegresoTexto = date ? this._formatViajeDateForPicker(date) : '';
+    this.setState({ fechaRegreso, fechaRegresoTexto }, () => {
+      this._validarFechasViajeEnCambio();
+    });
+  };
+
+  private _onCambiarTextoFechaViaje(
+    campo: 'fechaSalida' | 'fechaRegreso',
+    campoTexto: 'fechaSalidaTexto' | 'fechaRegresoTexto',
+    _ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void {
+    const textoEnmascarado = this._aplicarMascaraFechaViaje(newValue || '');
+    const digits = textoEnmascarado.replace(/\D/g, '');
+    const update: Pick<IProcopioFormsState, 'fechaSalida' | 'fechaRegreso' | 'fechaSalidaTexto' | 'fechaRegresoTexto'> = {
+      [campoTexto]: textoEnmascarado
+    } as Pick<IProcopioFormsState, 'fechaSalida' | 'fechaRegreso' | 'fechaSalidaTexto' | 'fechaRegresoTexto'>;
+
+    if (digits.length === 8) {
+      const parsed = this._parseViajeDateFromPickerString(textoEnmascarado);
+      update[campo] = parsed ? this._dateToViajeInputString(parsed) : '';
+    } else {
+      update[campo] = '';
+    }
+
+    this.setState(update, () => {
+      this._validarFechasViajeEnCambio();
+    });
+  }
+
+  private _onBlurTextoFechaViaje(
+    campo: 'fechaSalida' | 'fechaRegreso',
+    campoTexto: 'fechaSalidaTexto' | 'fechaRegresoTexto',
+    value: string,
+    texto: string
+  ): void {
+    const digits = (texto || '').replace(/\D/g, '');
+    if (!digits || digits.length === 8) {
+      return;
+    }
+    const update: Pick<IProcopioFormsState, 'fechaSalida' | 'fechaRegreso' | 'fechaSalidaTexto' | 'fechaRegresoTexto'> = {
+      [campoTexto]: this._fechaViajeTextoDesdeValor(value),
+      [campo]: value
+    } as Pick<IProcopioFormsState, 'fechaSalida' | 'fechaRegreso' | 'fechaSalidaTexto' | 'fechaRegresoTexto'>;
+    this.setState(update, () => {
+      this._validarFechasViajeEnCambio();
+    });
+  }
+
+  private _onCambiarTextoFechaSalida = (
+    ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void => {
+    this._onCambiarTextoFechaViaje('fechaSalida', 'fechaSalidaTexto', ev, newValue);
+  };
+
+  private _onCambiarTextoFechaRegreso = (
+    ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void => {
+    this._onCambiarTextoFechaViaje('fechaRegreso', 'fechaRegresoTexto', ev, newValue);
+  };
+
+  private _onBlurTextoFechaSalida = (): void => {
+    this._onBlurTextoFechaViaje(
+      'fechaSalida',
+      'fechaSalidaTexto',
+      this.state.fechaSalida,
+      this.state.fechaSalidaTexto
+    );
+  };
+
+  private _onBlurTextoFechaRegreso = (): void => {
+    this._onBlurTextoFechaViaje(
+      'fechaRegreso',
+      'fechaRegresoTexto',
+      this.state.fechaRegreso,
+      this.state.fechaRegresoTexto
+    );
+  };
+
+  private _onKeyDownViajeDatePickerCapture = (
+    ev: React.KeyboardEvent<HTMLDivElement>,
+    onBlurTexto: () => void
+  ): void => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      onBlurTexto();
+      const target = ev.target as HTMLElement;
+      if (target && typeof target.blur === 'function') {
+        target.blur();
+      }
+    }
+  };
+
+  private _patchViajeDateInputRef = (field: ITextField | null): void => {
+    if (!field) {
+      return;
+    }
+    const input = (field as { inputElement?: HTMLInputElement | null }).inputElement;
+    if (!input || input.dataset.viajeDateClickPatched === '1') {
+      return;
+    }
+    input.dataset.viajeDateClickPatched = '1';
+    input.addEventListener('click', (event: MouseEvent) => {
+      event.stopPropagation();
+    });
+  };
+
+  private _onBlurTextoFechaGenerico(
+    value: string,
+    texto: string,
+    onUpdate: (fecha: string, texto: string) => void
+  ): void {
+    const digits = (texto || '').replace(/\D/g, '');
+    if (!digits || digits.length === 8) {
+      return;
+    }
+    onUpdate(value, this._fechaViajeTextoDesdeValor(value));
+  }
+
+  private _onCambiarTextoFechaGenerico(
+    _ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue: string | undefined,
+    onUpdate: (fecha: string, texto: string) => void
+  ): void {
+    const textoEnmascarado = this._aplicarMascaraFechaViaje(newValue || '');
+    const digits = textoEnmascarado.replace(/\D/g, '');
+    let fecha = '';
+    if (digits.length === 8) {
+      const parsed = this._parseViajeDateFromPickerString(textoEnmascarado);
+      fecha = parsed ? this._dateToViajeInputString(parsed) : '';
+    }
+    onUpdate(fecha, textoEnmascarado);
+  }
+
+  private _onSeleccionarFechaNacimientoPasajero = (date: Date | null | undefined): void => {
+    const fechaNacimiento = date ? this._dateToViajeInputString(date) : '';
+    const pasajeroFechaNacimientoTexto = date ? this._formatViajeDateForPicker(date) : '';
+    this.setState((prev) => ({
+      pasajeroFechaNacimientoTexto,
+      nuevoPasajeroDraft: { ...prev.nuevoPasajeroDraft, fechaNacimiento }
+    }));
+  };
+
+  private _onCambiarTextoFechaNacimientoPasajero = (
+    ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void => {
+    this._onCambiarTextoFechaGenerico(ev, newValue, (fecha: string, texto: string) => {
+      this.setState((prev) => ({
+        pasajeroFechaNacimientoTexto: texto,
+        nuevoPasajeroDraft: { ...prev.nuevoPasajeroDraft, fechaNacimiento: fecha }
+      }));
+    });
+  };
+
+  private _onBlurTextoFechaNacimientoPasajero = (): void => {
+    this._onBlurTextoFechaGenerico(
+      this.state.nuevoPasajeroDraft.fechaNacimiento || '',
+      this.state.pasajeroFechaNacimientoTexto,
+      (fecha: string, texto: string) => {
+        this.setState((prev) => ({
+          pasajeroFechaNacimientoTexto: texto,
+          nuevoPasajeroDraft: { ...prev.nuevoPasajeroDraft, fechaNacimiento: fecha }
+        }));
+      }
+    );
+  };
+
+  private _onSeleccionarFechaMovimiento = (date: Date | null | undefined): void => {
+    const fecha = date ? this._dateToViajeInputString(date) : '';
+    const fechaTexto = date ? this._formatViajeDateForPicker(date) : '';
+    this.setState((prev) => ({
+      movimientoEnEdicion: { ...prev.movimientoEnEdicion, fecha, fechaTexto }
+    }));
+  };
+
+  private _onCambiarTextoFechaMovimiento = (
+    ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void => {
+    this._onCambiarTextoFechaGenerico(ev, newValue, (fecha: string, texto: string) => {
+      this.setState((prev) => ({
+        movimientoEnEdicion: { ...prev.movimientoEnEdicion, fecha, fechaTexto: texto }
+      }));
+    });
+  };
+
+  private _onBlurTextoFechaMovimiento = (): void => {
+    this._onBlurTextoFechaGenerico(
+      this.state.movimientoEnEdicion.fecha,
+      this.state.movimientoEnEdicion.fechaTexto,
+      (fecha: string, texto: string) => {
+        this.setState((prev) => ({
+          movimientoEnEdicion: { ...prev.movimientoEnEdicion, fecha, fechaTexto: texto }
+        }));
+      }
+    );
+  };
+
+  private _renderFormDatePicker(
+    value: string,
+    textoValue: string,
+    onSelectDate: (date: Date | null | undefined) => void,
+    onChangeTexto: (ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>, newValue?: string) => void,
+    onBlurTexto: () => void,
+    disabled?: boolean
+  ): React.ReactNode {
+    return (
+      <div
+        style={{ width: '100%' }}
+        onKeyDownCapture={(ev: React.KeyboardEvent<HTMLDivElement>) =>
+          this._onKeyDownViajeDatePickerCapture(ev, onBlurTexto)
+        }
+      >
+        <DatePicker
+        value={this._parseViajeDateStringToDate(value)}
+        onSelectDate={onSelectDate}
+        formatDate={(date: Date) => this._formatViajeDateForPicker(date)}
+        parseDateFromString={(dateStr: string) =>
+          this._parseViajeDateFromPickerString(this._aplicarMascaraFechaViaje(dateStr))
+        }
+        placeholder="dd/mm/aaaa"
+        allowTextInput={true}
+        openOnClick={false}
+        disableAutoFocus={true}
+        strings={VIAJE_DATE_PICKER_STRINGS}
+        firstDayOfWeek={DayOfWeek.Monday}
+        disabled={disabled === undefined ? this.state.guardando : disabled}
+        styles={{ root: { width: '100%' } }}
+        textField={{
+          value: textoValue,
+          onChange: onChangeTexto,
+          onBlur: onBlurTexto,
+          componentRef: this._patchViajeDateInputRef,
+          inputMode: 'numeric',
+          maxLength: 10,
+          styles: {
+            fieldGroup: {
+              height: 38,
+              borderRadius: 8,
+              border: '1.4px solid #CDD0D7',
+              background: '#FAFAFC'
+            },
+            field: {
+              fontSize: 15,
+              color: '#232529'
+            }
+          }
+        }}
+      />
+      </div>
+    );
+  }
+
   private _setSectionError = (section: keyof IProcopioFormsState['sectionErrors'], message: string): void => {
     this.setState(prev => ({
       sectionErrors: {
@@ -1113,19 +1530,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       };
     });
   };
-  private _onCambiarFechaSalida = (ev: React.ChangeEvent<HTMLInputElement>): void =>
-    this.setState({ fechaSalida: this._getDateOnlyFromSharePoint(ev.target.value) });
-  private _onCambiarFechaRegreso = (ev: React.ChangeEvent<HTMLInputElement>): void =>
-    this.setState({ fechaRegreso: this._getDateOnlyFromSharePoint(ev.target.value) });
   private _onCambiarEstado = (ev: React.ChangeEvent<HTMLSelectElement>): void => this.setState({ estado: this._normalizarEstado(ev.target.value) });
   private _onCambiarObservaciones = (ev: React.ChangeEvent<HTMLTextAreaElement>): void => this.setState({ observaciones: ev.target.value });
 
   private _onCambiarNuevoPasajero = (campo: keyof IPasajeroDraft, value: string): void => {
     this.setState(prev => ({ nuevoPasajeroDraft: { ...prev.nuevoPasajeroDraft, [campo]: value } }));
-  };
-
-  private _onCambiarFechaNacimientoPasajero = (ev: React.ChangeEvent<HTMLInputElement>): void => {
-    this._onCambiarNuevoPasajero('fechaNacimiento', this._getDateOnlyFromSharePoint(ev.target.value));
   };
 
   private _onCambiarBusquedaPasajero = (ev: React.ChangeEvent<HTMLInputElement>): void => {
@@ -1150,6 +1559,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       pasajeroEnEdicionId: null,
       pasajeroBusquedaTexto: '',
       pasajeroCamposHabilitados: false,
+      pasajeroFechaNacimientoTexto: '',
       nuevoPasajeroDraft: { nombreApellido: '', dni: '', pasaporte: '', telefono: '', email: '', observaciones: '', fechaNacimiento: '' }
     });
   };
@@ -1159,11 +1569,13 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this._clearSectionError('pasajeros');
     const pasajero = this.state.pasajeros.filter((p: IPasajero) => p.id === id)[0];
     if (!pasajero) { return; }
+    const fechaNacimiento = pasajero.fechaNacimiento || '';
     this.setState({
       mostrarEditorPasajero: true,
       pasajeroEnEdicionId: id,
       pasajeroBusquedaTexto: '',
       pasajeroCamposHabilitados: true,
+      pasajeroFechaNacimientoTexto: this._fechaViajeTextoDesdeValor(fechaNacimiento),
       nuevoPasajeroDraft: {
         nombreApellido: pasajero.nombreApellido,
         dni: pasajero.dni,
@@ -1171,7 +1583,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         telefono: pasajero.telefono || '',
         email: pasajero.email || '',
         observaciones: pasajero.observaciones || '',
-        fechaNacimiento: pasajero.fechaNacimiento || ''
+        fechaNacimiento
       }
     });
   };
@@ -1180,6 +1592,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this.setState({
       pasajeroCamposHabilitados: true,
       pasajeroBusquedaTexto: '',
+      pasajeroFechaNacimientoTexto: '',
       nuevoPasajeroDraft: { nombreApellido: '', dni: '', pasaporte: '', telefono: '', email: '', observaciones: '', fechaNacimiento: '' }
     });
   };
@@ -1298,6 +1711,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       pasajeroEnEdicionId: null,
       pasajeroBusquedaTexto: '',
       pasajeroCamposHabilitados: false,
+      pasajeroFechaNacimientoTexto: '',
       nuevoPasajeroDraft: this._resetEditorPasajero()
     });
   };
@@ -1516,10 +1930,23 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   private _abrirEditorMovimiento = (): void => {
     if (this._esSoloLectura()) { return; }
     this._clearSectionError('movimientos');
+    const fecha = this._getTodayDateInput();
     this.setState({
       mostrarEditorMovimiento: true,
       movimientoEnEdicionId: null,
-      movimientoEnEdicion: { tipo: 'Ingreso', movimiento: '', medioPago: '', fecha: this._getTodayDateInput(), moneda: 'Pesos', monto: '', observaciones: '', cotizacion: '', liquidacionOperadorId: '', servicioAsociadoId: '' }
+      movimientoEnEdicion: {
+        tipo: 'Ingreso',
+        movimiento: '',
+        medioPago: '',
+        fecha,
+        fechaTexto: this._fechaViajeTextoDesdeValor(fecha),
+        moneda: 'Pesos',
+        monto: '',
+        observaciones: '',
+        cotizacion: '',
+        liquidacionOperadorId: '',
+        servicioAsociadoId: ''
+      }
     });
   };
 
@@ -1712,6 +2139,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           movimiento: mov.movimiento,
           medioPago: mov.medioPago,
           fecha: mov.fecha,
+          fechaTexto: this._fechaViajeTextoDesdeValor(mov.fecha),
           moneda: this._normalizarMonedaPago(mov.moneda),
           monto: String(mov.monto),
           observaciones: mov.observaciones || '',
@@ -2630,6 +3058,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
 
   private _onGuardarViaje = async (): Promise<void> => {
     if (this._esSoloLectura()) { return; }
+    if (!this._validarFechasViaje()) {
+      return;
+    }
     try {
       this.setState({ guardando: true, error: '' });
       const pasajerosIdsResueltos = await this._resolverPasajerosIds();
@@ -3040,48 +3471,13 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                         {this._formatDateDisplay(this.state.fechaSalida)}
                       </div>
                     ) : (
-                    <div style={{ position: 'relative' }}>
-                      <input
-                        type="date"
-                        lang="es-AR"
-                        style={{
-                          width: '100%',
-                          height: 38,
-                          padding: '0 14px',
-                          borderRadius: 8,
-                          border: '1.4px solid #CDD0D7',
-                          background: '#FAFAFC',
-                          fontSize: 15,
-                          color: 'transparent',
-                          caretColor: 'transparent',
-                          outline: 'none',
-                          transition: 'border-color 0.18s',
-                          boxSizing: 'border-box',
-                        }}
-                        value={this._getDateOnlyFromSharePoint(this.state.fechaSalida)}
-                        onChange={this._onCambiarFechaSalida}
-                        disabled={this.state.guardando}
-                      />
-                      <div
-                        style={{
-                          position: 'absolute',
-                          left: 14,
-                          right: 42,
-                          top: 0,
-                          height: 38,
-                          display: 'flex',
-                          alignItems: 'center',
-                          fontSize: 15,
-                          color: '#232529',
-                          pointerEvents: 'none',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis'
-                        }}
-                      >
-                        {this._formatDateDisplay(this.state.fechaSalida)}
-                      </div>
-                    </div>
+                      this._renderFormDatePicker(
+                        this.state.fechaSalida,
+                        this.state.fechaSalidaTexto,
+                        this._onSeleccionarFechaSalida,
+                        this._onCambiarTextoFechaSalida,
+                        this._onBlurTextoFechaSalida
+                      )
                     )}
                   </div>
                   <div>
@@ -3116,48 +3512,13 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                         {this._formatDateDisplay(this.state.fechaRegreso)}
                       </div>
                     ) : (
-                    <div style={{ position: 'relative' }}>
-                      <input
-                        type="date"
-                        lang="es-AR"
-                        style={{
-                          width: '100%',
-                          height: 38,
-                          padding: '0 14px',
-                          borderRadius: 8,
-                          border: '1.4px solid #CDD0D7',
-                          background: '#FAFAFC',
-                          fontSize: 15,
-                          color: 'transparent',
-                          caretColor: 'transparent',
-                          outline: 'none',
-                          transition: 'border-color 0.18s',
-                          boxSizing: 'border-box',
-                        }}
-                        value={this._getDateOnlyFromSharePoint(this.state.fechaRegreso)}
-                        onChange={this._onCambiarFechaRegreso}
-                        disabled={this.state.guardando}
-                      />
-                      <div
-                        style={{
-                          position: 'absolute',
-                          left: 14,
-                          right: 42,
-                          top: 0,
-                          height: 38,
-                          display: 'flex',
-                          alignItems: 'center',
-                          fontSize: 15,
-                          color: '#232529',
-                          pointerEvents: 'none',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis'
-                        }}
-                      >
-                        {this._formatDateDisplay(this.state.fechaRegreso)}
-                      </div>
-                    </div>
+                      this._renderFormDatePicker(
+                        this.state.fechaRegreso,
+                        this.state.fechaRegresoTexto,
+                        this._onSeleccionarFechaRegreso,
+                        this._onCambiarTextoFechaRegreso,
+                        this._onBlurTextoFechaRegreso
+                      )
                     )}
                   </div>
                 </div>
@@ -3390,26 +3751,14 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                   </div>
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Fecha de nacimiento</label>
-                    <div style={pasajerosStyles.dateInputShell}>
-                      <input
-                        type="date"
-                        lang="es-AR"
-                        className={styles.pasajeroDateInput}
-                        value={this._getDateOnlyFromSharePoint(this.state.nuevoPasajeroDraft.fechaNacimiento || '')}
-                        onChange={this._onCambiarFechaNacimientoPasajero}
-                        disabled={!this.state.pasajeroCamposHabilitados || this.state.guardando}
-                      />
-                      <div
-                        style={{
-                          ...pasajerosStyles.dateInputOverlay,
-                          ...(this.state.nuevoPasajeroDraft.fechaNacimiento
-                            ? pasajerosStyles.dateInputOverlayValue
-                            : pasajerosStyles.dateInputOverlayPlaceholder)
-                        }}
-                      >
-                        {this._formatDateDisplay(this.state.nuevoPasajeroDraft.fechaNacimiento || '') || 'dd/mm/aaaa'}
-                      </div>
-                    </div>
+                    {this._renderFormDatePicker(
+                      this.state.nuevoPasajeroDraft.fechaNacimiento || '',
+                      this.state.pasajeroFechaNacimientoTexto,
+                      this._onSeleccionarFechaNacimientoPasajero,
+                      this._onCambiarTextoFechaNacimientoPasajero,
+                      this._onBlurTextoFechaNacimientoPasajero,
+                      !this.state.pasajeroCamposHabilitados || this.state.guardando
+                    )}
                   </div>
                 </div>
                 <button type="button" style={pasajerosStyles.btnPrimary} onClick={() => { void this._guardarPasajeroDraft(); }} disabled={this.state.guardando || !this.state.pasajeroCamposHabilitados}>Guardar</button>
@@ -3837,7 +4186,13 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                 <div style={layoutStyles.inlineEditorRow}>
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Fecha de pago</label>
-                    <input type="date" style={movimientosStyles.input} value={this.state.movimientoEnEdicion.fecha} onChange={e => this._actualizarCampoMovimiento('fecha', e.target.value)} disabled={this.state.guardando} />
+                    {this._renderFormDatePicker(
+                      this.state.movimientoEnEdicion.fecha,
+                      this.state.movimientoEnEdicion.fechaTexto,
+                      this._onSeleccionarFechaMovimiento,
+                      this._onCambiarTextoFechaMovimiento,
+                      this._onBlurTextoFechaMovimiento
+                    )}
                   </div>
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Monto</label>
