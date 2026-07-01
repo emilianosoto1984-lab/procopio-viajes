@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/spfx/client-side-extension-manifest.schema.json",
 
-  "id": "ca1bb2bc-13ef-44b4-b5ed-ef580c397771",
+  "id": "b62bfb4e-df02-41ec-b826-ba667ec84b7e",
   "alias": "ProcopioFormsFormCustomizer",
   "componentType": "Extension",
   "extensionType": "FormCustomizer",
