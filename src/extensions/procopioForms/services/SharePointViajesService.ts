@@ -251,7 +251,8 @@ export default class SharePointViajesService {
         destinoGeneralId: this._extractLookupId(item, destinoGeneralLookup) || undefined,
         destinoGeneralNombre: item[destinoGeneralLookup] ? this._getString(item[destinoGeneralLookup], 'Title') : undefined
       }))
-      .filter((d: IDestinoItem) => d.titulo.length > 0);
+      .filter((d: IDestinoItem) => d.titulo.length > 0)
+      .sort((a: IDestinoItem, b: IDestinoItem) => a.titulo.localeCompare(b.titulo, 'es'));
     return destinos;
   }
 
@@ -280,7 +281,8 @@ export default class SharePointViajesService {
         id: item.Id as number,
         titulo: this._getString(item, 'Title')
       }))
-      .filter((d: IDestinoGeneralItem) => d.id > 0 && d.titulo.length > 0);
+      .filter((d: IDestinoGeneralItem) => d.id > 0 && d.titulo.length > 0)
+      .sort((a: IDestinoGeneralItem, b: IDestinoGeneralItem) => a.titulo.localeCompare(b.titulo, 'es'));
   }
 
   public async getOperadores(): Promise<IOperadorItem[]> {
