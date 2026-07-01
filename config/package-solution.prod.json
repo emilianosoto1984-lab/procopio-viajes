@@ -3,7 +3,7 @@
   "solution": {
     "name": "procopio-client-side-solution",
     "id": "2cf3790b-275e-499e-b70f-40d7c344cf84",
-    "version": "1.0.14.0",
+    "version": "1.0.15.0",
     "includeClientSideAssets": true,
     "skipFeatureDeployment": true,
     "isDomainIsolated": false,
@@ -30,7 +30,7 @@
         "title": "procopio Feature",
         "description": "The feature that activates elements of the procopio solution.",
         "id": "ba7c2228-f919-4b38-83dd-04c14f26638d",
-        "version": "1.0.14.0"
+        "version": "1.0.15.0"
       }
     ]
   },
