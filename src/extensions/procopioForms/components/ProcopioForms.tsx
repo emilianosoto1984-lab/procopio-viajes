@@ -18,7 +18,28 @@ import SharePointViajesService, {
   IVoucherItem,
   IViajeData
 } from '../services/SharePointViajesService';
-import { DatePicker, DayOfWeek, IDatePickerStrings, ITextField } from '@fluentui/react';
+import {
+  DatePicker,
+  DayOfWeek,
+  IDatePickerStrings,
+  ITextField,
+  MessageBar,
+  MessageBarType,
+  Pivot,
+  PivotItem
+} from '@fluentui/react';
+import {
+  MEDIOS_PAGO,
+  MedioPago,
+  MOTIVO_VIAJE,
+  normalizarMedioPago,
+  requiereCuentaBancaria,
+  resolverEstadoPagoAlGuardar,
+  resolverMotivoViaje
+} from '../../../shared/pagoMedioUtils';
+import { buildConceptoPagoConViaje } from '../../../shared/pagoConceptoUtils';
+import ReciboPagoService, { IReciboPagoGeneracionData } from '../../../shared/ReciboPagoService';
+import { debeGenerarReciboPago } from '../../../shared/reciboPagoUtils';
 
 export interface IProcopioFormsProps {
   context: FormCustomizerContext;
@@ -80,6 +101,81 @@ interface IMovimiento {
   liquidacionOperadorId?: number;
   servicioAsociadoId?: number;
   liquidacionOperadorNombre?: string;
+  banco?: string;
+  estado?: string;
+  pasajeroId?: number;
+  pasajeroNombre?: string;
+}
+
+type MovimientoEstadoView = 'aprobados' | 'pendientes';
+
+function normalizeEstado(estado?: string): string {
+  return (estado || '').trim().toLowerCase();
+}
+
+function isMovimientoAprobado(movimiento: IMovimiento): boolean {
+  return normalizeEstado(movimiento.estado) === 'aprobado';
+}
+
+function isMovimientoPendiente(movimiento: IMovimiento): boolean {
+  return normalizeEstado(movimiento.estado) === 'pendiente';
+}
+
+function isMovimientoSinEstado(movimiento: IMovimiento): boolean {
+  return normalizeEstado(movimiento.estado) === '';
+}
+
+/**
+ * Solo movimientos Aprobados (y históricos sin Estado) impactan saldos/totales.
+ * Pendientes se excluyen.
+ */
+function isPagoConsideradoEnTotales(pago: { estado?: string }): boolean {
+  const estado = (pago.estado || '').trim().toLowerCase();
+  return estado === '' || estado === 'aprobado';
+}
+
+function contarMovimientosAprobados(movimientos: IMovimiento[]): number {
+  return movimientos.filter(isMovimientoAprobado).length;
+}
+
+function contarMovimientosPendientes(movimientos: IMovimiento[]): number {
+  return movimientos.filter(isMovimientoPendiente).length;
+}
+
+function contarMovimientosSinEstado(movimientos: IMovimiento[]): number {
+  return movimientos.filter(isMovimientoSinEstado).length;
+}
+
+function compararFechaPagoDesc(a: IMovimiento, b: IMovimiento): number {
+  const fechaA = a.fecha || '';
+  const fechaB = b.fecha || '';
+  if (fechaA === fechaB) {
+    return b.id - a.id;
+  }
+  return fechaA < fechaB ? 1 : -1;
+}
+
+function getMovimientosDeVista(
+  movimientos: IMovimiento[],
+  vista: MovimientoEstadoView
+): IMovimiento[] {
+  const filtrados =
+    vista === 'aprobados'
+      ? movimientos.filter(
+          (m: IMovimiento) => isMovimientoAprobado(m) || isMovimientoSinEstado(m)
+        )
+      : movimientos.filter(isMovimientoPendiente);
+  return filtrados.slice().sort(compararFechaPagoDesc);
+}
+
+function resolverVistaMovimientosTrasCambio(
+  vistaActual: MovimientoEstadoView,
+  movimientos: IMovimiento[]
+): MovimientoEstadoView {
+  if (vistaActual === 'pendientes' && contarMovimientosPendientes(movimientos) === 0) {
+    return 'aprobados';
+  }
+  return vistaActual;
 }
 
 interface IPasajero extends IPasajeroItem {}
@@ -129,7 +225,22 @@ interface IProcopioFormsState {
     liquidacionOperadorId: string;
     servicioAsociadoId: string;
     fechaTexto: string;
+    banco: string;
+    pasajeroId: string;
   };
+  movimientoFieldErrors: {
+    medioPago: string;
+    banco: string;
+    pasajero: string;
+  };
+  movimientoEstadoView: MovimientoEstadoView;
+  opcionesBanco: string[];
+  opcionesBancoCargando: boolean;
+  opcionesBancoError: string;
+  opcionesMotivo: string[];
+  opcionesMotivoError: string;
+  reciboUrlByPagoId: { [pagoId: number]: string };
+  reciboGenerando: boolean;
   pasajeroFechaNacimientoTexto: string;
   nuevoPasajeroDraft: IPasajeroDraft;
   pasajeroBusquedaTexto: string;
@@ -490,7 +601,21 @@ const movimientosStyles = {
   btnDefault: { ...layoutStyles.defaultButton, borderRadius: movimientosRadius.control },
   btnPrimary: { ...layoutStyles.primaryButton, borderRadius: movimientosRadius.control },
   btnSmall: { ...layoutStyles.smallButton, borderRadius: movimientosRadius.control },
-  inlineFormRoot: { marginTop: 10, paddingTop: 6 }
+  inlineFormRoot: { marginTop: 10, paddingTop: 6 },
+  pivotWrap: {
+    marginBottom: 10,
+    display: 'flex',
+    flexWrap: 'wrap' as 'wrap'
+  },
+  rowPendiente: {
+    backgroundColor: '#fffaf0'
+  } as React.CSSProperties,
+  legacyHint: {
+    marginTop: 6,
+    marginBottom: 10,
+    fontSize: 12.5,
+    color: '#605e5c'
+  } as React.CSSProperties
 };
 
 /** Border-radius tokens for Vouchers only (aligned with other sections). */
@@ -697,11 +822,25 @@ const GridIconTrash: React.FC = () => (
   </svg>
 );
 
+const GridIconCheck: React.FC = () => (
+  <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+);
+
 const GridIconDownload: React.FC = () => (
   <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
     <polyline points="7 10 12 15 17 10" />
     <line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+);
+
+const GridIconExternalLink: React.FC = () => (
+  <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    <polyline points="15 3 21 3 21 9" />
+    <line x1="10" y1="14" x2="21" y2="3" />
   </svg>
 );
 
@@ -859,10 +998,16 @@ const GridIconActionButton: React.FC<IGridIconActionButtonProps> = (props: IGrid
 
 export default class ProcopioForms extends React.Component<IProcopioFormsProps, IProcopioFormsState> {
   private _service: SharePointViajesService;
+  private readonly _reciboService: ReciboPagoService;
 
   public constructor(props: IProcopioFormsProps) {
     super(props);
     this._service = new SharePointViajesService(props.context);
+    this._reciboService = new ReciboPagoService({
+      spHttpClient: props.context.spHttpClient,
+      webAbsoluteUrl: props.context.pageContext.web.absoluteUrl,
+      webServerRelativeUrl: props.context.pageContext.web.serverRelativeUrl
+    });
     const fechaMovimientoInicial = this._getTodayDateInput();
     this.state = {
       viajeId: null,
@@ -909,8 +1054,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         observaciones: '',
         cotizacion: '',
         liquidacionOperadorId: '',
-        servicioAsociadoId: ''
+        servicioAsociadoId: '',
+        banco: '',
+        pasajeroId: ''
       },
+      movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
+      movimientoEstadoView: 'aprobados',
+      opcionesBanco: [],
+      opcionesBancoCargando: false,
+      opcionesBancoError: '',
+      opcionesMotivo: [],
+      opcionesMotivoError: '',
+      reciboUrlByPagoId: {},
+      reciboGenerando: false,
       movimientoEnEdicionId: null,
       mostrarEditorMovimiento: false,
       mostrarEditorVoucher: false,
@@ -960,6 +1116,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         this._service.getDestinosGenerales(),
         this._service.getOperadores()
       ]);
+      void this._cargarOpcionesPagoChoices();
       const itemId = this._getItemId();
       if ((this.props.displayMode === FormDisplayMode.Edit || this.props.displayMode === FormDisplayMode.Display) && itemId) {
         const viaje = await this._service.getViajeById(itemId);
@@ -1009,10 +1166,10 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           movimientos: pagos.map(p => ({
             id: p.id,
             movimiento: p.concepto,
-            medioPago: p.medioPago,
+            medioPago: normalizarMedioPago(p.medioPago),
             fecha: p.fechaPago,
             moneda: this._normalizarMonedaPago(p.moneda),
-            monto: p.importe,
+            monto: p.monto,
             observaciones: p.observaciones,
             cotizacion: p.cotizacion,
             tipo:
@@ -1023,19 +1180,66 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                   : 'Ingreso',
             liquidacionOperadorId: p.liquidacionOperadorId,
             servicioAsociadoId: p.servicioAsociadoId,
-            liquidacionOperadorNombre: p.liquidacionOperadorNombre
+            liquidacionOperadorNombre: p.liquidacionOperadorNombre,
+            banco: requiereCuentaBancaria(normalizarMedioPago(p.medioPago)) ? (p.banco || '') : '',
+            estado: p.estado || '',
+            pasajeroId: p.pasajeroId && p.pasajeroId > 0 ? p.pasajeroId : undefined,
+            pasajeroNombre: p.pasajeroNombre || ''
           })),
           liquidacionesOperador: liquidaciones,
           vouchers,
           facturas,
           presupuesto,
+          reciboUrlByPagoId: {},
           cargando: false
+        }, () => {
+          void this._sincronizarRecibosMovimientos(this.state.movimientos);
         });
         return;
       }
       this.setState({ pasajeros, destinos, destinosGenerales, operadores, cargando: false });
     } catch (error) {
       this.setState({ cargando: false, error: 'No se pudieron cargar los datos de SharePoint.' });
+    }
+  }
+
+  private async _cargarOpcionesPagoChoices(): Promise<void> {
+    this.setState({
+      opcionesBancoCargando: true,
+      opcionesBancoError: '',
+      opcionesMotivoError: ''
+    });
+    try {
+      const [opcionesBanco, opcionesMotivo] = await Promise.all([
+        this._service.getBancoChoices(),
+        this._service.getMotivoChoices()
+      ]);
+      const motivoViaje = resolverMotivoViaje(opcionesMotivo);
+      this.setState({
+        opcionesBanco,
+        opcionesBancoCargando: false,
+        opcionesBancoError: '',
+        opcionesMotivo,
+        opcionesMotivoError: motivoViaje
+          ? ''
+          : 'La opción de Motivo "' +
+            MOTIVO_VIAJE +
+            '" no existe en SharePoint. Configurá el Choice Motivo antes de guardar pagos.'
+      });
+      if (!motivoViaje) {
+        console.warn(
+          '[ProcopioForms] Motivo "' + MOTIVO_VIAJE + '" no encontrado en opciones de SharePoint'
+        );
+      }
+    } catch (error) {
+      this.setState({
+        opcionesBanco: [],
+        opcionesBancoCargando: false,
+        opcionesBancoError: 'No se pudieron cargar las cuentas bancarias.',
+        opcionesMotivo: [],
+        opcionesMotivoError:
+          'No se pudieron cargar las opciones de Motivo desde SharePoint.'
+      });
     }
   }
 
@@ -1927,6 +2131,51 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     );
   };
 
+  private _getPasajerosDelViaje(): IPasajero[] {
+    return this.state.pasajeros
+      .filter(
+        (p: IPasajero) => p.id > 0 && this.state.pasajerosIds.indexOf(p.id) >= 0
+      )
+      .slice()
+      .sort((a: IPasajero, b: IPasajero) =>
+        a.nombreApellido.localeCompare(b.nombreApellido, 'es')
+      );
+  }
+
+  private _formatPasajeroOpcion(pasajero: IPasajero): string {
+    const nombre = (pasajero.nombreApellido || '').trim() || 'Pasajero';
+    const dni = (pasajero.dni || '').trim();
+    return dni ? nombre + ' — DNI ' + dni : nombre;
+  }
+
+  private _resolverPasajeroIdInicialNuevoIngreso(): string {
+    const pasajeros = this._getPasajerosDelViaje();
+    return pasajeros.length === 1 ? String(pasajeros[0].id) : '';
+  }
+
+  private _esPasajeroDelViaje(pasajeroId: number): boolean {
+    return (
+      pasajeroId > 0 &&
+      this.state.pasajerosIds.indexOf(pasajeroId) >= 0 &&
+      this.state.pasajeros.some((p: IPasajero) => p.id === pasajeroId)
+    );
+  }
+
+  private _getNombrePasajeroMovimiento(movimiento: IMovimiento): string {
+    if (movimiento.pasajeroId && movimiento.pasajeroId > 0) {
+      const delViaje = this.state.pasajeros.filter(
+        (p: IPasajero) => p.id === movimiento.pasajeroId
+      )[0];
+      if (delViaje && (delViaje.nombreApellido || '').trim()) {
+        return delViaje.nombreApellido;
+      }
+      if ((movimiento.pasajeroNombre || '').trim()) {
+        return movimiento.pasajeroNombre as string;
+      }
+    }
+    return 'Sin pasajero';
+  }
+
   private _abrirEditorMovimiento = (): void => {
     if (this._esSoloLectura()) { return; }
     this._clearSectionError('movimientos');
@@ -1934,6 +2183,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this.setState({
       mostrarEditorMovimiento: true,
       movimientoEnEdicionId: null,
+      movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
       movimientoEnEdicion: {
         tipo: 'Ingreso',
         movimiento: '',
@@ -1945,7 +2195,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         observaciones: '',
         cotizacion: '',
         liquidacionOperadorId: '',
-        servicioAsociadoId: ''
+        servicioAsociadoId: '',
+        banco: '',
+        pasajeroId: this._resolverPasajeroIdInicialNuevoIngreso()
       }
     });
   };
@@ -1958,7 +2210,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       movimientoEnEdicion: {
         ...prev.movimientoEnEdicion,
         servicioAsociadoId: servicioIdRaw,
-        movimiento: servicio ? servicio.concepto : ''
+        movimiento: servicio
+          ? this._buildConceptoMovimientoConViaje(servicio.concepto)
+          : ''
       }
     }));
   };
@@ -1970,10 +2224,42 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       movimientoEnEdicion: {
         ...prev.movimientoEnEdicion,
         liquidacionOperadorId: liquidacionIdRaw,
-        movimiento: liquidacion ? liquidacion.codigoReferencia : ''
+        movimiento: liquidacion
+          ? this._buildConceptoMovimientoConViaje(liquidacion.codigoReferencia)
+          : ''
       }
     }));
   };
+
+  /** Concepto persistido: "{Servicio|Liquidación} - {Nombre del viaje}". */
+  private _buildConceptoMovimientoConViaje(nombreBase: string): string {
+    return buildConceptoPagoConViaje(nombreBase, this.state.nombreViaje);
+  }
+
+  private _resolverConceptoMovimientoParaGuardar(
+    tipo: 'Ingreso' | 'Egreso',
+    servicioAsociadoId?: number,
+    liquidacionOperadorId?: number
+  ): string {
+    if (tipo === 'Ingreso') {
+      const servicioId = servicioAsociadoId && servicioAsociadoId > 0
+        ? servicioAsociadoId
+        : Number(this.state.movimientoEnEdicion.servicioAsociadoId) || 0;
+      const servicio = this.state.servicios.filter((s: IServicio) => s.id === servicioId)[0];
+      return servicio
+        ? this._buildConceptoMovimientoConViaje(servicio.concepto)
+        : this._buildConceptoMovimientoConViaje(this.state.movimientoEnEdicion.movimiento);
+    }
+    const liquidacionId = liquidacionOperadorId && liquidacionOperadorId > 0
+      ? liquidacionOperadorId
+      : Number(this.state.movimientoEnEdicion.liquidacionOperadorId) || 0;
+    const liquidacion = this.state.liquidacionesOperador.filter(
+      (l: ILiquidacionItem) => l.id === liquidacionId
+    )[0];
+    return liquidacion
+      ? this._buildConceptoMovimientoConViaje(liquidacion.codigoReferencia)
+      : this._buildConceptoMovimientoConViaje(this.state.movimientoEnEdicion.movimiento);
+  }
 
   private _getMonedaRelacionadaMovimiento(): string {
     if (this.state.movimientoEnEdicion.tipo === 'Ingreso') {
@@ -2112,16 +2398,67 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this.setState(prev => ({ movimientoEnEdicion: { ...prev.movimientoEnEdicion, [campo]: valor } }));
   };
 
-  private _onCambiarTipoMovimiento = (ev: React.ChangeEvent<HTMLSelectElement>): void => {
-    const tipo = ev.target.value === 'Egreso' ? 'Egreso' : 'Ingreso';
+  private _onCambiarMedioPagoMovimiento = (medioPagoRaw: string): void => {
+    const medioPago = normalizarMedioPago(medioPagoRaw);
+    const limpiaBanco = !requiereCuentaBancaria(medioPago);
+    this._clearSectionError('movimientos');
     this.setState(prev => ({
       movimientoEnEdicion: {
         ...prev.movimientoEnEdicion,
-        tipo,
-        movimiento: '',
-        liquidacionOperadorId: '',
-        servicioAsociadoId: ''
+        medioPago,
+        banco: limpiaBanco ? '' : prev.movimientoEnEdicion.banco
+      },
+      movimientoFieldErrors: {
+        medioPago: '',
+        banco: limpiaBanco ? '' : prev.movimientoFieldErrors.banco,
+        pasajero: prev.movimientoFieldErrors.pasajero
       }
+    }));
+  };
+
+  private _onCambiarBancoMovimiento = (banco: string): void => {
+    this._clearSectionError('movimientos');
+    this.setState(prev => ({
+      movimientoEnEdicion: { ...prev.movimientoEnEdicion, banco },
+      movimientoFieldErrors: { ...prev.movimientoFieldErrors, banco: '' }
+    }));
+  };
+
+  private _onCambiarTipoMovimiento = (ev: React.ChangeEvent<HTMLSelectElement>): void => {
+    const tipo = ev.target.value === 'Egreso' ? 'Egreso' : 'Ingreso';
+    this._clearSectionError('movimientos');
+    this.setState(prev => {
+      let pasajeroId = prev.movimientoEnEdicion.pasajeroId;
+      if (tipo === 'Ingreso' && !(Number(pasajeroId) > 0)) {
+        const unicos = prev.pasajeros.filter(
+          (p: IPasajero) => p.id > 0 && prev.pasajerosIds.indexOf(p.id) >= 0
+        );
+        if (unicos.length === 1) {
+          pasajeroId = String(unicos[0].id);
+        }
+      }
+      return {
+        movimientoEnEdicion: {
+          ...prev.movimientoEnEdicion,
+          tipo,
+          movimiento: '',
+          liquidacionOperadorId: '',
+          servicioAsociadoId: '',
+          pasajeroId
+        },
+        movimientoFieldErrors: {
+          ...prev.movimientoFieldErrors,
+          pasajero: ''
+        }
+      };
+    });
+  };
+
+  private _onCambiarPasajeroMovimiento = (pasajeroIdRaw: string): void => {
+    this._clearSectionError('movimientos');
+    this.setState(prev => ({
+      movimientoEnEdicion: { ...prev.movimientoEnEdicion, pasajeroId: pasajeroIdRaw },
+      movimientoFieldErrors: { ...prev.movimientoFieldErrors, pasajero: '' }
     }));
   };
 
@@ -2130,14 +2467,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this.setState(prev => {
       const mov = prev.movimientos.filter((m: IMovimiento) => m.id === id)[0];
       if (!mov) { return prev; }
+      const medioPago = normalizarMedioPago(mov.medioPago);
       return {
         ...prev,
         mostrarEditorMovimiento: true,
         movimientoEnEdicionId: id,
+        movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
         movimientoEnEdicion: {
           tipo: mov.tipo,
           movimiento: mov.movimiento,
-          medioPago: mov.medioPago,
+          medioPago,
           fecha: mov.fecha,
           fechaTexto: this._fechaViajeTextoDesdeValor(mov.fecha),
           moneda: this._normalizarMonedaPago(mov.moneda),
@@ -2145,7 +2484,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           observaciones: mov.observaciones || '',
           cotizacion: mov.cotizacion !== undefined ? String(mov.cotizacion) : '',
           liquidacionOperadorId: mov.liquidacionOperadorId ? String(mov.liquidacionOperadorId) : '',
-          servicioAsociadoId: mov.servicioAsociadoId ? String(mov.servicioAsociadoId) : ''
+          servicioAsociadoId: mov.servicioAsociadoId ? String(mov.servicioAsociadoId) : '',
+          banco: requiereCuentaBancaria(medioPago) ? (mov.banco || '') : '',
+          pasajeroId: mov.pasajeroId && mov.pasajeroId > 0 ? String(mov.pasajeroId) : ''
         }
       };
     });
@@ -2153,6 +2494,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
 
   private _cancelarMovimiento = (): void => {
     this.setState({ mostrarEditorMovimiento: false, movimientoEnEdicionId: null });
+  };
+
+  private _onCambiarVistaMovimientos = (item?: PivotItem): void => {
+    if (!item || !item.props.itemKey) {
+      return;
+    }
+    const key = item.props.itemKey;
+    if (key === 'aprobados' || key === 'pendientes') {
+      this.setState({ movimientoEstadoView: key });
+    }
   };
 
   private _abrirEditorVoucher = (): void => {
@@ -2602,7 +2953,13 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     });
 
     return movimientos
-      .filter((m: IMovimiento) => m.tipo === 'Ingreso' && m.monto > 0 && !!m.servicioAsociadoId)
+      .filter(
+        (m: IMovimiento) =>
+          isPagoConsideradoEnTotales(m) &&
+          m.tipo === 'Ingreso' &&
+          m.monto > 0 &&
+          !!m.servicioAsociadoId
+      )
       .reduce(
         (acc: { usd: number; ars: number }, m: IMovimiento) => {
           const servicio = serviciosById[m.servicioAsociadoId as number];
@@ -2626,6 +2983,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     return this.state.movimientos
       .filter(
         (m: IMovimiento) =>
+          isPagoConsideradoEnTotales(m) &&
           m.tipo === 'Ingreso' &&
           m.monto > 0 &&
           m.servicioAsociadoId === servicio.id &&
@@ -2864,7 +3222,205 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     return result;
   }
 
-  private async _guardarPagoEnSharePoint(viajeId: number): Promise<void> {
+  private _obtenerDatosReciboDesdeMovimiento(params: {
+    pasajeroId?: number | null;
+    pasajeroNombre?: string;
+    concepto: string;
+    fechaPago: string;
+    monto: number;
+    moneda: string;
+    medioPago: string;
+  }): Omit<IReciboPagoGeneracionData, 'itemId'> {
+    const pasajeroId = params.pasajeroId && params.pasajeroId > 0 ? params.pasajeroId : 0;
+    const pasajero = pasajeroId > 0
+      ? this.state.pasajeros.filter((p: IPasajero) => p.id === pasajeroId)[0]
+      : undefined;
+    return {
+      fechaPago: params.fechaPago,
+      nombreApellido: pasajero
+        ? pasajero.nombreApellido
+        : (params.pasajeroNombre || '').trim(),
+      dni: pasajero ? (pasajero.dni || '') : '',
+      concepto: (params.concepto || '').trim(),
+      monto: Number(params.monto) || 0,
+      moneda: this._normalizarMonedaPago(params.moneda),
+      formaPago: params.medioPago
+    };
+  }
+
+  private async _generarYAdjuntarReciboPago(
+    itemId: number,
+    datos: Omit<IReciboPagoGeneracionData, 'itemId'>,
+    opciones?: { regenerar?: boolean }
+  ): Promise<boolean> {
+    try {
+      const payload = { itemId, ...datos };
+      const resultado = opciones && opciones.regenerar
+        ? await this._reciboService.regenerarRecibo(payload)
+        : await this._reciboService.generarYAdjuntarRecibo(payload);
+      if (!resultado.skipped) {
+        const url = await this._reciboService.getReciboAttachmentUrl(itemId, datos.fechaPago);
+        if (url) {
+          this.setState((prev) => ({
+            reciboUrlByPagoId: {
+              ...prev.reciboUrlByPagoId,
+              [itemId]: url
+            }
+          }));
+        }
+      } else if (!this.state.reciboUrlByPagoId[itemId]) {
+        const url = await this._reciboService.getReciboAttachmentUrl(itemId, datos.fechaPago);
+        if (url) {
+          this.setState((prev) => ({
+            reciboUrlByPagoId: {
+              ...prev.reciboUrlByPagoId,
+              [itemId]: url
+            }
+          }));
+        }
+      }
+      return true;
+    } catch (error) {
+      console.error('[ProcopioForms] Error al generar o adjuntar el recibo de pago:', error);
+      if (error instanceof Error) {
+        console.error('[ProcopioForms] Detalle:', error.message);
+        if (error.stack) {
+          console.error(error.stack);
+        }
+      }
+      return false;
+    }
+  }
+
+  private async _sincronizarRecibosMovimientos(movimientos: IMovimiento[]): Promise<void> {
+    const candidatos = movimientos.filter(
+      (m: IMovimiento) => m.tipo === 'Ingreso' && isMovimientoAprobado(m) && m.id > 0
+    );
+    if (candidatos.length === 0) {
+      return;
+    }
+
+    const reciboUrlByPagoId: { [pagoId: number]: string } = { ...this.state.reciboUrlByPagoId };
+    await Promise.all(
+      candidatos.map(async (m: IMovimiento) => {
+        try {
+          const url = await this._reciboService.getReciboAttachmentUrl(m.id, m.fecha);
+          if (url) {
+            reciboUrlByPagoId[m.id] = url;
+          }
+        } catch (error) {
+          console.error('[ProcopioForms] No se pudo consultar recibo del pago', m.id, error);
+        }
+      })
+    );
+    this.setState({ reciboUrlByPagoId });
+  }
+
+  private _abrirReciboAdjunto = (serverRelativeUrl: string): void => {
+    if (!serverRelativeUrl) {
+      return;
+    }
+    if (serverRelativeUrl.indexOf('http') === 0) {
+      window.open(serverRelativeUrl, '_blank');
+      return;
+    }
+    const origin = new URL(this.props.context.pageContext.web.absoluteUrl).origin;
+    window.open(origin + serverRelativeUrl, '_blank');
+  };
+
+  private _abrirDetallePago = async (pagoId: number): Promise<void> => {
+    if (!pagoId || pagoId <= 0) {
+      return;
+    }
+    try {
+      const urlDetallePago = await this._service.getPagoDisplayFormUrl(pagoId);
+      window.open(urlDetallePago, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      console.error('[ProcopioForms] No se pudo abrir el detalle del pago:', error);
+      this._setSectionError(
+        'movimientos',
+        'No se pudo abrir el detalle del pago en Registro de Pagos.'
+      );
+    }
+  };
+
+  private _puedeRegenerarReciboMovimiento(): boolean {
+    if (this._esSoloLectura() || !this.state.movimientoEnEdicionId) {
+      return false;
+    }
+    if (this.state.movimientoEnEdicion.tipo !== 'Ingreso') {
+      return false;
+    }
+    const movimiento = this.state.movimientos.filter(
+      (m: IMovimiento) => m.id === this.state.movimientoEnEdicionId
+    )[0];
+    return !!movimiento && isMovimientoAprobado(movimiento);
+  }
+
+  private _onRegenerarReciboMovimiento = async (): Promise<void> => {
+    if (this._esSoloLectura() || this.state.reciboGenerando || this.state.guardando) {
+      return;
+    }
+    const itemId = this.state.movimientoEnEdicionId;
+    if (!itemId || !this._puedeRegenerarReciboMovimiento()) {
+      return;
+    }
+
+    const confirmar = window.confirm(
+      '¿Desea regenerar el recibo de pago? Se utilizarán los datos actuales del formulario y se reemplazará el archivo existente.'
+    );
+    if (!confirmar) {
+      return;
+    }
+
+    const pasajeroIdRaw = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
+    const datosRecibo = this._obtenerDatosReciboDesdeMovimiento({
+      pasajeroId: pasajeroIdRaw > 0 ? pasajeroIdRaw : null,
+      concepto: this.state.movimientoEnEdicion.movimiento,
+      fechaPago: this.state.movimientoEnEdicion.fecha,
+      monto: Number(this.state.movimientoEnEdicion.monto) || 0,
+      moneda: this.state.movimientoEnEdicion.moneda,
+      medioPago: normalizarMedioPago(this.state.movimientoEnEdicion.medioPago)
+    });
+
+    try {
+      this.setState({ reciboGenerando: true });
+      this._clearSectionError('movimientos');
+      const resultado = await this._reciboService.regenerarRecibo({
+        itemId,
+        ...datosRecibo
+      });
+      const url = await this._reciboService.getReciboAttachmentUrl(itemId, datosRecibo.fechaPago);
+      this.setState((prev) => ({
+        reciboUrlByPagoId: url
+          ? { ...prev.reciboUrlByPagoId, [itemId]: url }
+          : prev.reciboUrlByPagoId,
+        reciboGenerando: false
+      }));
+      console.log('[ProcopioForms] Recibo regenerado:', resultado.fileName);
+    } catch (error) {
+      console.error('[ProcopioForms] Error al regenerar el recibo de pago:', error);
+      if (error instanceof Error) {
+        console.error('[ProcopioForms] Detalle:', error.message);
+        if (error.stack) {
+          console.error(error.stack);
+        }
+      }
+      this.setState({ reciboGenerando: false });
+      this._setSectionError(
+        'movimientos',
+        'No se pudo regenerar el recibo de pago. Verifique la plantilla y los datos del formulario.'
+      );
+    }
+  };
+
+  private async _guardarPagoEnSharePoint(viajeId: number): Promise<{
+    itemId: number;
+    esCreacion: boolean;
+    tipoPago: 'Ingreso' | 'Egreso';
+    estado: string;
+    datosRecibo: Omit<IReciboPagoGeneracionData, 'itemId'>;
+  } | undefined> {
     const esEgreso = this.state.movimientoEnEdicion.tipo === 'Egreso';
     const esIngreso = this.state.movimientoEnEdicion.tipo === 'Ingreso';
     const selLiq = Number(this.state.movimientoEnEdicion.liquidacionOperadorId);
@@ -2885,19 +3441,98 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       servicioAsociadoId = esEdicion ? 0 : undefined;
     }
 
+    const medioPago = normalizarMedioPago(this.state.movimientoEnEdicion.medioPago);
+    const movimientoOriginal = esEdicion
+      ? this.state.movimientos.filter((m: IMovimiento) => m.id === this.state.movimientoEnEdicionId)[0]
+      : undefined;
+    const estado = resolverEstadoPagoAlGuardar(
+      medioPago,
+      movimientoOriginal ? movimientoOriginal.medioPago : undefined,
+      movimientoOriginal ? movimientoOriginal.estado : undefined,
+      esEdicion
+    );
+    const banco = requiereCuentaBancaria(medioPago)
+      ? (this.state.movimientoEnEdicion.banco || '').trim()
+      : null;
+    const motivo = resolverMotivoViaje(this.state.opcionesMotivo);
+    if (!motivo) {
+      this._setSectionError(
+        'movimientos',
+        this.state.opcionesMotivoError ||
+          'La opción de Motivo "' +
+            MOTIVO_VIAJE +
+            '" no existe en SharePoint. Configurá el Choice Motivo antes de guardar pagos.'
+      );
+      return undefined;
+    }
+    const pasajeroIdRaw = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
+    const pasajeroSeleccionado = pasajeroIdRaw > 0
+      ? this.state.pasajeros.filter((p: IPasajero) => p.id === pasajeroIdRaw)[0]
+      : undefined;
+    const pasajeroId =
+      pasajeroIdRaw > 0 && this._esPasajeroDelViaje(pasajeroIdRaw) ? pasajeroIdRaw : null;
+    const pasajeroNombre = pasajeroSeleccionado
+      ? pasajeroSeleccionado.nombreApellido
+      : '';
+
+    const tipoPago: 'Ingreso' | 'Egreso' =
+      this.state.movimientoEnEdicion.tipo === 'Egreso' ? 'Egreso' : 'Ingreso';
+    const concepto = this._resolverConceptoMovimientoParaGuardar(
+      tipoPago,
+      servicioAsociadoId && servicioAsociadoId > 0 ? servicioAsociadoId : undefined,
+      liquidacionOperadorId && liquidacionOperadorId > 0 ? liquidacionOperadorId : undefined
+    );
+    // TEMP diagnóstico Concepto — quitar cuando se confirme la causa
+    const nombreServicioDiag =
+      tipoPago === 'Ingreso'
+        ? (
+            this.state.servicios.filter(
+              (s: IServicio) => s.id === (servicioAsociadoId && servicioAsociadoId > 0
+                ? servicioAsociadoId
+                : Number(this.state.movimientoEnEdicion.servicioAsociadoId) || 0)
+            )[0] || { concepto: '' }
+          ).concepto
+        : (
+            this.state.liquidacionesOperador.filter(
+              (l: ILiquidacionItem) =>
+                l.id ===
+                (liquidacionOperadorId && liquidacionOperadorId > 0
+                  ? liquidacionOperadorId
+                  : Number(this.state.movimientoEnEdicion.liquidacionOperadorId) || 0)
+            )[0] || { codigoReferencia: '' }
+          ).codigoReferencia;
+    console.log('[Concepto pago] origen=ProcopioForms');
+    console.log('[Concepto pago] servicio:', nombreServicioDiag);
+    console.log('[Concepto pago] viaje:', this.state.nombreViaje);
+    console.log('[Concepto pago] concepto generado:', concepto);
     const pagoData: IPagoData = {
       viajeId,
-      concepto: this.state.movimientoEnEdicion.movimiento,
+      concepto,
       fechaPago: this.state.movimientoEnEdicion.fecha,
-      importe: Number(this.state.movimientoEnEdicion.monto) || 0,
-      medioPago: this.state.movimientoEnEdicion.medioPago,
+      monto: Number(this.state.movimientoEnEdicion.monto) || 0,
+      medioPago,
       moneda: this._normalizarMonedaPago(this.state.movimientoEnEdicion.moneda),
-      tipoPago: this.state.movimientoEnEdicion.tipo === 'Egreso' ? 'Egreso' : 'Ingreso',
+      tipoPago,
       observaciones: (this.state.movimientoEnEdicion.observaciones || '').trim(),
       cotizacion: this._requiereCotizacionMovimiento() ? (Number(this.state.movimientoEnEdicion.cotizacion) || 0) : undefined,
       liquidacionOperadorId,
-      servicioAsociadoId
+      servicioAsociadoId,
+      banco,
+      estado,
+      motivo,
+      pasajeroId,
+      pasajeroNombre
     };
+
+    const datosRecibo = this._obtenerDatosReciboDesdeMovimiento({
+      pasajeroId,
+      pasajeroNombre,
+      concepto: pagoData.concepto,
+      fechaPago: pagoData.fechaPago,
+      monto: pagoData.monto,
+      moneda: pagoData.moneda,
+      medioPago: pagoData.medioPago
+    });
 
     const nombreLiquidacion =
       esEgreso && selLiq > 0
@@ -2905,15 +3540,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         : undefined;
 
     if (this.state.movimientoEnEdicionId) {
-      await this._service.updatePago(this.state.movimientoEnEdicionId, pagoData);
-      this.setState(prev => ({
-        movimientos: prev.movimientos.map(m =>
+      const itemId = this.state.movimientoEnEdicionId;
+      await this._service.updatePago(itemId, pagoData);
+      this.setState(prev => {
+        const movimientos = prev.movimientos.map(m =>
           m.id === prev.movimientoEnEdicionId
             ? {
                 ...m,
                 movimiento: pagoData.concepto,
                 fecha: pagoData.fechaPago,
-                monto: pagoData.importe,
+                monto: pagoData.monto,
                 observaciones: pagoData.observaciones,
                 cotizacion: pagoData.cotizacion,
                 medioPago: pagoData.medioPago,
@@ -2921,24 +3557,42 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                 tipo: this.state.movimientoEnEdicion.tipo,
                 liquidacionOperadorId: pagoData.liquidacionOperadorId && pagoData.liquidacionOperadorId > 0 ? pagoData.liquidacionOperadorId : undefined,
                 servicioAsociadoId: pagoData.servicioAsociadoId && pagoData.servicioAsociadoId > 0 ? pagoData.servicioAsociadoId : undefined,
-                liquidacionOperadorNombre: nombreLiquidacion
+                liquidacionOperadorNombre: nombreLiquidacion,
+                banco: banco || '',
+                estado: estado,
+                pasajeroId: pasajeroId || undefined,
+                pasajeroNombre: pasajeroNombre || ''
               }
             : m
-        ),
-        mostrarEditorMovimiento: false,
-        movimientoEnEdicionId: null
-      }));
-      return;
+        );
+        return {
+          movimientos,
+          mostrarEditorMovimiento: false,
+          movimientoEnEdicionId: null,
+          movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
+          movimientoEstadoView: resolverVistaMovimientosTrasCambio(
+            prev.movimientoEstadoView,
+            movimientos
+          )
+        };
+      });
+      return {
+        itemId,
+        esCreacion: false,
+        tipoPago,
+        estado,
+        datosRecibo
+      };
     }
 
     const created = await this._service.createPago(pagoData);
-    this.setState(prev => ({
-      movimientos: prev.movimientos.concat([
+    this.setState(prev => {
+      const movimientos = prev.movimientos.concat([
         {
           id: created.id,
           movimiento: created.concepto,
           fecha: created.fechaPago,
-          monto: created.importe,
+          monto: created.monto,
           observaciones: created.observaciones,
           cotizacion: created.cotizacion,
           medioPago: created.medioPago,
@@ -2946,20 +3600,72 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           tipo: this.state.movimientoEnEdicion.tipo,
           liquidacionOperadorId: pagoData.liquidacionOperadorId && pagoData.liquidacionOperadorId > 0 ? pagoData.liquidacionOperadorId : undefined,
           servicioAsociadoId: created.servicioAsociadoId && created.servicioAsociadoId > 0 ? created.servicioAsociadoId : undefined,
-          liquidacionOperadorNombre: nombreLiquidacion
+          liquidacionOperadorNombre: nombreLiquidacion,
+          banco: banco || '',
+          estado: estado,
+          pasajeroId: pasajeroId || undefined,
+          pasajeroNombre: pasajeroNombre || ''
         }
-      ]),
-      mostrarEditorMovimiento: false,
-      movimientoEnEdicionId: null
-    }));
+      ]);
+      return {
+        movimientos,
+        mostrarEditorMovimiento: false,
+        movimientoEnEdicionId: null,
+        movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
+        movimientoEstadoView: resolverVistaMovimientosTrasCambio(
+          prev.movimientoEstadoView,
+          movimientos
+        )
+      };
+    });
+    return {
+      itemId: created.id,
+      esCreacion: true,
+      tipoPago,
+      estado,
+      datosRecibo
+    };
   }
 
   private _guardarMovimiento = async (): Promise<void> => {
-    if (this._esSoloLectura()) { return; }
+    if (this._esSoloLectura() || this.state.reciboGenerando) { return; }
     if (!this.state.viajeId) {
       this._setSectionError('movimientos', 'Primero guarda el viaje para habilitar pagos.');
       return;
     }
+
+    const medioPago = normalizarMedioPago(this.state.movimientoEnEdicion.medioPago);
+    const esIngresoPrecheck = this.state.movimientoEnEdicion.tipo === 'Ingreso';
+    const pasajeroIdSeleccionado = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
+    const movimientoFieldErrors = { medioPago: '', banco: '', pasajero: '' };
+    let camposPagoValidos = true;
+    if (!medioPago) {
+      movimientoFieldErrors.medioPago = 'El medio de pago es obligatorio.';
+      camposPagoValidos = false;
+    }
+    if (requiereCuentaBancaria(medioPago)) {
+      if (!(this.state.movimientoEnEdicion.banco || '').trim()) {
+        movimientoFieldErrors.banco =
+          'La cuenta bancaria es obligatoria cuando el medio de pago es Transferencia.';
+        camposPagoValidos = false;
+      }
+    }
+    if (esIngresoPrecheck) {
+      if (pasajeroIdSeleccionado <= 0) {
+        movimientoFieldErrors.pasajero = 'Seleccioná el pasajero asociado al pago.';
+        camposPagoValidos = false;
+      } else if (!this._esPasajeroDelViaje(pasajeroIdSeleccionado)) {
+        movimientoFieldErrors.pasajero =
+          'El pasajero seleccionado no pertenece al viaje. Elegí un pasajero válido.';
+        camposPagoValidos = false;
+      }
+    }
+    if (!camposPagoValidos) {
+      this.setState({ movimientoFieldErrors });
+      return;
+    }
+    this.setState({ movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' } });
+
     const esIngreso = this.state.movimientoEnEdicion.tipo === 'Ingreso';
     let servicioSeleccionadoIngreso: IServicio | undefined;
     if (esIngreso) {
@@ -2997,7 +3703,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         return;
       }
     }
-    const concepto = (this.state.movimientoEnEdicion.movimiento || '').trim();
+    const concepto = this._resolverConceptoMovimientoParaGuardar(
+      esIngreso ? 'Ingreso' : 'Egreso',
+      esIngreso && servicioSeleccionadoIngreso ? servicioSeleccionadoIngreso.id : undefined,
+      !esIngreso ? Number(this.state.movimientoEnEdicion.liquidacionOperadorId) || undefined : undefined
+    );
     if (!concepto) {
       this._setSectionError('movimientos', 'Indica el concepto del movimiento.');
       return;
@@ -3034,7 +3744,29 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     try {
       this.setState({ guardando: true });
       this._clearSectionError('movimientos');
-      await this._guardarPagoEnSharePoint(this.state.viajeId);
+      const guardado = await this._guardarPagoEnSharePoint(this.state.viajeId);
+      if (
+        guardado &&
+        debeGenerarReciboPago({
+          tipoPago: guardado.tipoPago,
+          estado: guardado.estado,
+          motivo: guardado.esCreacion ? 'creacion' : 'edicion'
+        })
+      ) {
+        const reciboOk = await this._generarYAdjuntarReciboPago(
+          guardado.itemId,
+          guardado.datosRecibo,
+          { regenerar: !guardado.esCreacion }
+        );
+        if (!reciboOk) {
+          this._setSectionError(
+            'movimientos',
+            guardado.esCreacion
+              ? 'El pago fue guardado correctamente, pero el recibo no pudo generarse. Puede reintentar más tarde o contactar al administrador.'
+              : 'El pago fue actualizado correctamente, pero el recibo no pudo regenerarse. Puede usar Regenerar recibo o contactar al administrador.'
+          );
+        }
+      }
     } catch (error) {
       this._setSectionError('movimientos', 'No se pudo guardar el pago en "Registro de Pagos".');
     } finally {
@@ -3048,9 +3780,83 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       this.setState({ guardando: true });
       this._clearSectionError('movimientos');
       await this._service.deletePago(id);
-      this.setState(prev => ({ movimientos: prev.movimientos.filter(m => m.id !== id) }));
+      this.setState(prev => {
+        const movimientos = prev.movimientos.filter(m => m.id !== id);
+        return {
+          movimientos,
+          movimientoEstadoView: resolverVistaMovimientosTrasCambio(
+            prev.movimientoEstadoView,
+            movimientos
+          )
+        };
+      });
     } catch (error) {
       this._setSectionError('movimientos', 'No se pudo eliminar el pago.');
+    } finally {
+      this.setState({ guardando: false });
+    }
+  };
+
+  private _aprobarMovimiento = async (id: number): Promise<void> => {
+    if (this._esSoloLectura()) { return; }
+    const movimiento = this.state.movimientos.filter((m: IMovimiento) => m.id === id)[0];
+    if (!movimiento || !isMovimientoPendiente(movimiento)) {
+      return;
+    }
+    if (
+      movimiento.tipo === 'Ingreso' &&
+      (!(movimiento.pasajeroId && movimiento.pasajeroId > 0) ||
+        !this._esPasajeroDelViaje(movimiento.pasajeroId as number))
+    ) {
+      this._setSectionError(
+        'movimientos',
+        'Antes de aprobar el pago, asigná un pasajero. Editá el movimiento y seleccioná uno del viaje.'
+      );
+      return;
+    }
+    try {
+      this.setState({ guardando: true });
+      this._clearSectionError('movimientos');
+      await this._service.approvePago(id);
+      this.setState(prev => {
+        const movimientos = prev.movimientos.map((m: IMovimiento) =>
+          m.id === id ? { ...m, estado: 'Aprobado' } : m
+        );
+        return {
+          movimientos,
+          movimientoEstadoView: resolverVistaMovimientosTrasCambio(
+            prev.movimientoEstadoView,
+            movimientos
+          )
+        };
+      });
+
+      if (
+        debeGenerarReciboPago({
+          tipoPago: movimiento.tipo,
+          estado: 'Aprobado',
+          motivo: 'aprobacion'
+        })
+      ) {
+        const datosRecibo = this._obtenerDatosReciboDesdeMovimiento({
+          pasajeroId: movimiento.pasajeroId,
+          pasajeroNombre: movimiento.pasajeroNombre,
+          concepto: movimiento.movimiento,
+          fechaPago: movimiento.fecha,
+          monto: movimiento.monto,
+          moneda: movimiento.moneda,
+          medioPago: movimiento.medioPago
+        });
+        const reciboOk = await this._generarYAdjuntarReciboPago(id, datosRecibo);
+        if (!reciboOk) {
+          this._setSectionError(
+            'movimientos',
+            'El pago fue aprobado correctamente, pero el recibo no pudo generarse. Puede reintentar más tarde o contactar al administrador.'
+          );
+        }
+      }
+    } catch (error) {
+      this._setSectionError('movimientos', 'No se pudo aprobar el pago.');
     } finally {
       this.setState({ guardando: false });
     }
@@ -3116,10 +3922,33 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     const liquidacionesDisponiblesEgreso = this.state.liquidacionesOperador.filter(
       (l: ILiquidacionItem) => l.id > 0 && !!(l.codigoReferencia || '').trim()
     );
+    const pasajerosDelViaje = this._getPasajerosDelViaje();
+    const pasajeroEditorId = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
+    const pasajeroEditorHuerfano =
+      pasajeroEditorId > 0 && !this._esPasajeroDelViaje(pasajeroEditorId)
+        ? this.state.movimientos.filter(
+            (m: IMovimiento) => m.id === this.state.movimientoEnEdicionId
+          )[0]
+        : undefined;
     const destinosParticularesFiltrados = this.state.destinoGeneralId > 0
       ? this.state.destinos.filter((d: IDestinoItem) => d.destinoGeneralId === this.state.destinoGeneralId)
       : [];
     const requiereCotizacionMovimiento = this._requiereCotizacionMovimiento();
+    const cantidadAprobados = contarMovimientosAprobados(this.state.movimientos);
+    const cantidadPendientes = contarMovimientosPendientes(this.state.movimientos);
+    const cantidadSinEstado = contarMovimientosSinEstado(this.state.movimientos);
+    const movimientosVista = getMovimientosDeVista(
+      this.state.movimientos,
+      this.state.movimientoEstadoView
+    );
+    const mostrarAvisoPendientes =
+      this.state.movimientoEstadoView === 'aprobados' && cantidadPendientes > 0;
+    const mensajeVacioMovimientos =
+      this.state.movimientoEstadoView === 'pendientes'
+        ? 'No hay pagos pendientes de aprobación.'
+        : this.state.movimientos.length === 0
+          ? 'No hay ingresos o egresos registrados.'
+          : 'No hay movimientos aprobados en esta vista.';
 
     if (this.state.cargando) {
       return <div style={layoutStyles.page}>Cargando datos...</div>;
@@ -4055,46 +4884,125 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
               )}
             </div>
             {this.state.sectionErrors.movimientos && <div style={layoutStyles.error}>{this.state.sectionErrors.movimientos}</div>}
+            <div style={movimientosStyles.pivotWrap}>
+              <Pivot
+                selectedKey={this.state.movimientoEstadoView}
+                onLinkClick={this._onCambiarVistaMovimientos}
+                headersOnly={true}
+                getTabId={(itemKey: string) => 'movimientos-vista-' + itemKey}
+                aria-label="Vistas de ingresos y egresos por estado"
+              >
+                <PivotItem
+                  headerText={'Aprobados (' + cantidadAprobados + ')'}
+                  itemKey="aprobados"
+                />
+                <PivotItem
+                  headerText={'Pendientes (' + cantidadPendientes + ')'}
+                  itemKey="pendientes"
+                />
+              </Pivot>
+            </div>
+            {mostrarAvisoPendientes && (
+              <MessageBar
+                messageBarType={MessageBarType.warning}
+                isMultiline={false}
+                styles={{ root: { marginBottom: 10 } }}
+              >
+                {cantidadPendientes === 1
+                  ? 'Hay 1 pago pendiente de aprobación.'
+                  : 'Hay ' + cantidadPendientes + ' pagos pendientes de aprobación.'}
+              </MessageBar>
+            )}
+            {this.state.movimientoEstadoView === 'aprobados' && cantidadSinEstado > 0 && (
+              <div style={movimientosStyles.legacyHint}>
+                Además, hay {cantidadSinEstado} movimiento
+                {cantidadSinEstado === 1 ? '' : 's'} histórico
+                {cantidadSinEstado === 1 ? '' : 's'} sin estado.
+              </div>
+            )}
             <div style={movimientosStyles.tableOuter}>
               <table style={movimientosStyles.table}>
                 <thead>
                   <tr style={layoutStyles.tableHeaderRow}>
                     <th style={{ ...layoutStyles.th, paddingLeft: 16 }}>Tipo</th>
                     <th style={layoutStyles.th}>Concepto</th>
+                    <th style={layoutStyles.th}>Pasajero</th>
                     <th style={layoutStyles.th}>Moneda</th>
                     <th style={layoutStyles.th}>Medio de pago</th>
                     <th style={layoutStyles.th}>Fecha de pago</th>
                     <th style={{ ...layoutStyles.th, textAlign: 'right' }}>Monto</th>
-                    {!soloLectura && <th style={{ ...layoutStyles.th, textAlign: 'right', paddingRight: 16 }}>Acciones</th>}
+                    <th style={{ ...layoutStyles.th, textAlign: 'right', paddingRight: 16 }}>Acciones</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {this.state.movimientos.map(m => (
-                    <tr key={m.id}>
-                      <td style={{ ...layoutStyles.td, paddingLeft: 16 }}>{m.tipo}</td>
-                      <td style={layoutStyles.td}>{this._getConceptoMostradoGrillaMovimiento(m)}</td>
-                      <td style={layoutStyles.td}>{this._getEtiquetaMonedaPago(m.moneda)}</td>
-                      <td style={layoutStyles.td}>{m.medioPago}</td>
-                      <td style={layoutStyles.td}>{m.fecha}</td>
-                      <td style={{ ...layoutStyles.td, textAlign: 'right' }}>{m.monto.toLocaleString('es-MX', { style: 'currency', currency: 'MXN' })}</td>
-                      {!soloLectura && (
+                  {movimientosVista.map(m => {
+                    const esPendiente = isMovimientoPendiente(m);
+                    const rowStyle = esPendiente ? movimientosStyles.rowPendiente : undefined;
+                    const reciboUrl =
+                      this.state.movimientoEstadoView === 'aprobados' &&
+                      m.tipo === 'Ingreso' &&
+                      isMovimientoAprobado(m)
+                        ? this.state.reciboUrlByPagoId[m.id] || ''
+                        : '';
+                    return (
+                      <tr key={m.id} style={rowStyle}>
+                        <td style={{ ...layoutStyles.td, paddingLeft: 16 }}>{m.tipo}</td>
+                        <td style={layoutStyles.td}>{this._getConceptoMostradoGrillaMovimiento(m)}</td>
+                        <td style={layoutStyles.td}>{this._getNombrePasajeroMovimiento(m)}</td>
+                        <td style={layoutStyles.td}>{this._getEtiquetaMonedaPago(m.moneda)}</td>
+                        <td style={layoutStyles.td}>{m.medioPago}</td>
+                        <td style={layoutStyles.td}>{m.fecha}</td>
+                        <td style={{ ...layoutStyles.td, textAlign: 'right' }}>
+                          {m.monto.toLocaleString('es-MX', { style: 'currency', currency: 'MXN' })}
+                        </td>
                         <td style={{ ...layoutStyles.td, ...layoutStyles.actionsCell, paddingRight: 16 }}>
                           <div style={gridActionBarStyle}>
-                            <GridIconActionButton title="Editar" onClick={() => this._editarMovimiento(m.id)} disabled={!pagosHabilitados || this.state.guardando}>
-                              <GridIconEdit />
-                            </GridIconActionButton>
-                            <GridIconActionButton title="Eliminar" onClick={() => this._eliminarMovimiento(m.id)} disabled={!pagosHabilitados || this.state.guardando}>
-                              <GridIconTrash />
-                            </GridIconActionButton>
+                            {m.id > 0 && (
+                              <GridIconActionButton
+                                title="Ver detalle"
+                                onClick={() => { void this._abrirDetallePago(m.id); }}
+                                disabled={this.state.guardando}
+                              >
+                                <GridIconExternalLink />
+                              </GridIconActionButton>
+                            )}
+                            {!!reciboUrl && (
+                              <GridIconActionButton
+                                title="Ver recibo"
+                                onClick={() => this._abrirReciboAdjunto(reciboUrl)}
+                                disabled={this.state.guardando}
+                              >
+                                <GridIconDownload />
+                              </GridIconActionButton>
+                            )}
+                            {!soloLectura && this.state.movimientoEstadoView === 'pendientes' && (
+                              <GridIconActionButton
+                                title="Aprobar"
+                                onClick={() => { void this._aprobarMovimiento(m.id); }}
+                                disabled={!pagosHabilitados || this.state.guardando}
+                              >
+                                <GridIconCheck />
+                              </GridIconActionButton>
+                            )}
+                            {!soloLectura && (
+                              <GridIconActionButton title="Editar" onClick={() => this._editarMovimiento(m.id)} disabled={!pagosHabilitados || this.state.guardando}>
+                                <GridIconEdit />
+                              </GridIconActionButton>
+                            )}
+                            {!soloLectura && (
+                              <GridIconActionButton title="Eliminar" onClick={() => this._eliminarMovimiento(m.id)} disabled={!pagosHabilitados || this.state.guardando}>
+                                <GridIconTrash />
+                              </GridIconActionButton>
+                            )}
                           </div>
                         </td>
-                      )}
-                    </tr>
-                  ))}
-                  {this.state.movimientos.length === 0 && (
+                      </tr>
+                    );
+                  })}
+                  {movimientosVista.length === 0 && (
                     <tr>
-                      <td style={layoutStyles.emptyTableCell} colSpan={soloLectura ? 6 : 7}>
-                        No hay ingresos o egresos registrados.
+                      <td style={layoutStyles.emptyTableCell} colSpan={8}>
+                        {mensajeVacioMovimientos}
                       </td>
                     </tr>
                   )}
@@ -4159,14 +5067,103 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                     )}
                   </div>
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
-                    <label style={layoutStyles.label}>Medio de pago</label>
-                    <select style={movimientosStyles.select} value={this.state.movimientoEnEdicion.medioPago} onChange={e => this._actualizarCampoMovimiento('medioPago', e.target.value)} disabled={this.state.guardando}>
+                    <label style={layoutStyles.label}>
+                      Pasajero
+                      {this.state.movimientoEnEdicion.tipo === 'Ingreso' ? '' : ' (opcional)'}
+                    </label>
+                    <select
+                      style={movimientosStyles.select}
+                      value={this.state.movimientoEnEdicion.pasajeroId}
+                      onChange={e => this._onCambiarPasajeroMovimiento(e.target.value)}
+                      disabled={this.state.guardando || pasajerosDelViaje.length === 0}
+                    >
                       <option value="">Seleccione...</option>
-                      <option value="Transferencia">Transferencia</option>
-                      <option value="Tarjeta de Crédito">Tarjeta de Crédito</option>
-                      <option value="Efectivo">Efectivo</option>
+                      {pasajeroEditorHuerfano && (
+                        <option value={String(pasajeroEditorId)}>
+                          {(pasajeroEditorHuerfano.pasajeroNombre || 'Pasajero') +
+                            ' (no pertenece al viaje)'}
+                        </option>
+                      )}
+                      {pasajerosDelViaje.map((pasajero: IPasajero) => (
+                        <option key={pasajero.id} value={String(pasajero.id)}>
+                          {this._formatPasajeroOpcion(pasajero)}
+                        </option>
+                      ))}
                     </select>
+                    {pasajerosDelViaje.length === 0 && (
+                      <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
+                        El viaje no tiene pasajeros asociados. Agregá al menos uno para registrar un ingreso.
+                      </div>
+                    )}
+                    {pasajeroEditorHuerfano && (
+                      <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
+                        El pasajero guardado ya no pertenece al viaje. Seleccioná uno válido.
+                      </div>
+                    )}
+                    {this.state.movimientoFieldErrors.pasajero && (
+                      <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
+                        {this.state.movimientoFieldErrors.pasajero}
+                      </div>
+                    )}
                   </div>
+                  <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
+                    <label style={layoutStyles.label}>Medio de pago</label>
+                    <select
+                      style={movimientosStyles.select}
+                      value={this.state.movimientoEnEdicion.medioPago}
+                      onChange={e => this._onCambiarMedioPagoMovimiento(e.target.value)}
+                      disabled={this.state.guardando}
+                    >
+                      <option value="">Seleccione...</option>
+                      {MEDIOS_PAGO.map((medio: MedioPago) => (
+                        <option key={medio} value={medio}>
+                          {medio}
+                        </option>
+                      ))}
+                    </select>
+                    {this.state.movimientoFieldErrors.medioPago && (
+                      <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
+                        {this.state.movimientoFieldErrors.medioPago}
+                      </div>
+                    )}
+                  </div>
+                  {requiereCuentaBancaria(this.state.movimientoEnEdicion.medioPago) && (
+                    <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
+                      <label style={layoutStyles.label}>Cuenta Bancaria</label>
+                      <select
+                        style={movimientosStyles.select}
+                        value={this.state.movimientoEnEdicion.banco}
+                        onChange={e => this._onCambiarBancoMovimiento(e.target.value)}
+                        disabled={
+                          this.state.guardando ||
+                          this.state.opcionesBancoCargando ||
+                          this.state.opcionesBanco.length === 0
+                        }
+                      >
+                        <option value="">Seleccione...</option>
+                        {this.state.opcionesBanco.map((opcion: string) => (
+                          <option key={opcion} value={opcion}>
+                            {opcion}
+                          </option>
+                        ))}
+                      </select>
+                      {this.state.opcionesBancoCargando && (
+                        <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
+                          Cargando cuentas bancarias...
+                        </div>
+                      )}
+                      {this.state.opcionesBancoError && (
+                        <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
+                          {this.state.opcionesBancoError}
+                        </div>
+                      )}
+                      {this.state.movimientoFieldErrors.banco && (
+                        <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
+                          {this.state.movimientoFieldErrors.banco}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Moneda</label>
                     <select
@@ -4222,9 +5219,48 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                     />
                   </div>
                 </div>
+                {this.state.reciboGenerando && (
+                  <div style={{ ...layoutStyles.info, marginBottom: 8 }}>Generando recibo de pago...</div>
+                )}
                 <div>
-                  <button type="button" style={movimientosStyles.btnPrimary} onClick={this._guardarMovimiento} disabled={this.state.guardando}>Guardar</button>
-                  <button type="button" style={movimientosStyles.btnDefault} onClick={this._cancelarMovimiento} disabled={this.state.guardando}>Cancelar</button>
+                  <button
+                    type="button"
+                    style={
+                      this.state.guardando || this.state.reciboGenerando
+                        ? { ...movimientosStyles.btnPrimary, ...layoutStyles.buttonDisabled }
+                        : movimientosStyles.btnPrimary
+                    }
+                    onClick={() => { void this._guardarMovimiento(); }}
+                    disabled={this.state.guardando || this.state.reciboGenerando}
+                  >
+                    Guardar
+                  </button>
+                  {this._puedeRegenerarReciboMovimiento() && (
+                    <button
+                      type="button"
+                      style={
+                        this.state.guardando || this.state.reciboGenerando
+                          ? { ...movimientosStyles.btnDefault, ...layoutStyles.buttonDisabled }
+                          : movimientosStyles.btnDefault
+                      }
+                      onClick={() => { void this._onRegenerarReciboMovimiento(); }}
+                      disabled={this.state.guardando || this.state.reciboGenerando}
+                    >
+                      {this.state.reciboGenerando ? 'Regenerando recibo...' : 'Regenerar recibo'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    style={
+                      this.state.guardando || this.state.reciboGenerando
+                        ? { ...movimientosStyles.btnDefault, ...layoutStyles.buttonDisabled }
+                        : movimientosStyles.btnDefault
+                    }
+                    onClick={this._cancelarMovimiento}
+                    disabled={this.state.guardando || this.state.reciboGenerando}
+                  >
+                    Cancelar
+                  </button>
                 </div>
               </div>
             )}

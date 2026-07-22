@@ -9,19 +9,41 @@ import SharePointPagosService, {
   IServicioViajeItem,
   IViajeLookupItem
 } from '../services/SharePointPagosService';
+import ReciboPagoService from '../../../shared/ReciboPagoService';
+import { debeGenerarReciboPago } from '../../../shared/reciboPagoUtils';
 import {
   formatDateDisplay,
   getDateOnlyFromSharePoint
 } from '../../../shared/sharePointDateUtils';
 import {
+  aplicarMascaraFecha,
+  dateToInputString,
+  fechaTextoDesdeValor,
+  FORM_DATE_PICKER_STRINGS,
+  formatDateForPicker,
+  parseDateFromPickerString,
+  parseDateStringToDate
+} from '../../../shared/formDatePickerUtils';
+import { DatePicker, DayOfWeek, ITextField } from '@fluentui/react';
+import {
   normalizarMonedaServicio,
   requiereCotizacionPago
 } from '../../../shared/pagoMonedaUtils';
+import {
+  MEDIOS_PAGO,
+  MedioPago,
+  requiereCuentaBancaria,
+  resolverMotivoViaje
+} from '../../../shared/pagoMedioUtils';
 import {
   formatSaldoPendienteDisplay,
   getSaldoPendienteServicio,
   montoExcedeSaldoPendiente
 } from '../../../shared/pagoSaldoUtils';
+import {
+  buildConceptoPagoConViaje,
+  servicioCoincideConConceptoGuardado
+} from '../../../shared/pagoConceptoUtils';
 import styles from './RegistroPagosForm.module.scss';
 
 export interface IRegistroPagosFormProps {
@@ -32,9 +54,7 @@ export interface IRegistroPagosFormProps {
 }
 
 const LOG_SOURCE: string = 'RegistroPagosForm';
-const MOTIVO_VIAJE = 'Viaje';
 
-const MEDIOS_PAGO = ['Efectivo', 'Transferencia', 'Tarjeta de Credito'] as const;
 const MONEDAS = ['Dólares', 'Pesos'] as const;
 const TIPOS_PAGO = ['Ingreso', 'Egreso'] as const;
 const TIPOS_INGRESO = [
@@ -42,7 +62,6 @@ const TIPOS_INGRESO = [
   { key: 'sin_viaje', label: 'Sin viaje asociado' }
 ] as const;
 
-type MedioPago = typeof MEDIOS_PAGO[number];
 type Moneda = typeof MONEDAS[number];
 type TipoPago = typeof TIPOS_PAGO[number];
 type TipoIngresoPago = typeof TIPOS_INGRESO[number]['key'];
@@ -89,6 +108,7 @@ interface IRegistroPagosFormState {
   motivo: string;
   opcionesMotivo: string[];
   fechaPago: string;
+  fechaPagoTexto: string;
   monto: string;
   moneda: string;
   cotizacion: string;
@@ -105,6 +125,7 @@ interface IRegistroPagosFormState {
   comprobantesSubiendo: boolean;
   comprobantesError: string;
   mostrarEditorComprobante: boolean;
+  reciboGenerando: boolean;
 }
 
 const layoutStyles: { [key: string]: React.CSSProperties } = {
@@ -414,6 +435,7 @@ const layoutStyles: { [key: string]: React.CSSProperties } = {
   dialogText: { fontSize: 14, color: '#605e5c', lineHeight: 1.5, marginBottom: 20 },
   dialogActions: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
   sectionToolbar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  sectionToolbarActions: { display: 'flex', gap: 8, flexShrink: 0 },
   toolbarTitle: { fontSize: 16, fontWeight: 600 },
   info: { marginBottom: 10, color: '#605e5c', fontSize: 13 },
   fileInputWrap: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 },
@@ -527,11 +549,17 @@ const emptyFieldErrors = (): IFieldErrors => ({
 
 export default class RegistroPagosForm extends React.Component<IRegistroPagosFormProps, IRegistroPagosFormState> {
   private readonly _service: SharePointPagosService;
+  private readonly _reciboService: ReciboPagoService;
   private _viajeSearchTimer: number | undefined;
 
   public constructor(props: IRegistroPagosFormProps) {
     super(props);
     this._service = new SharePointPagosService(props.context);
+    this._reciboService = new ReciboPagoService({
+      spHttpClient: props.context.spHttpClient,
+      webAbsoluteUrl: props.context.pageContext.web.absoluteUrl,
+      webServerRelativeUrl: props.context.pageContext.web.serverRelativeUrl
+    });
     this.state = {
       pagoId: null,
       tipoPago: 'Ingreso',
@@ -559,6 +587,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       motivo: '',
       opcionesMotivo: [],
       fechaPago: '',
+      fechaPagoTexto: '',
       monto: '',
       moneda: '',
       cotizacion: '',
@@ -574,7 +603,8 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       comprobantesPendientes: [],
       comprobantesSubiendo: false,
       comprobantesError: '',
-      mostrarEditorComprobante: false
+      mostrarEditorComprobante: false,
+      reciboGenerando: false
     };
   }
 
@@ -600,9 +630,10 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
   }
 
   private _resolverMotivoViaje(opcionesMotivo: string[]): string {
-    if (opcionesMotivo.indexOf(MOTIVO_VIAJE) >= 0) {
+    const motivo = resolverMotivoViaje(opcionesMotivo);
+    if (motivo) {
       console.log('Tipo asociado a viaje: Motivo seteado en Viaje');
-      return MOTIVO_VIAJE;
+      return motivo;
     }
     console.warn('Motivo Viaje no encontrado en opciones de SharePoint');
     return '';
@@ -770,21 +801,22 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       let servicioAsociadoId: number | null = null;
       let concepto = '';
       let conceptoMoneda = '';
+      const nombreViaje = this.state.viajeTitulo;
 
       if (servicioIdPrecargado && servicioIdPrecargado > 0) {
         const servicio = serviciosViaje.filter((item: IServicioViajeItem) => item.id === servicioIdPrecargado)[0];
         if (servicio) {
           servicioAsociadoId = servicio.id;
-          concepto = servicio.concepto;
+          concepto = buildConceptoPagoConViaje(servicio.concepto, nombreViaje);
           conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
         }
       } else if (conceptoPrecargado) {
-        const servicio = serviciosViaje.filter(
-          (item: IServicioViajeItem) => item.concepto === conceptoPrecargado
+        const servicio = serviciosViaje.filter((item: IServicioViajeItem) =>
+          servicioCoincideConConceptoGuardado(item.concepto, conceptoPrecargado, nombreViaje)
         )[0];
         if (servicio) {
           servicioAsociadoId = servicio.id;
-          concepto = servicio.concepto;
+          concepto = buildConceptoPagoConViaje(servicio.concepto, nombreViaje);
           conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
         } else {
           concepto = conceptoPrecargado;
@@ -807,7 +839,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
   }
 
   private _requiereCuentaBancaria(): boolean {
-    return this.state.medioPago === 'Transferencia';
+    return requiereCuentaBancaria(this.state.medioPago);
   }
 
   private _logVisibilidadCuentaBancaria(medioPago: string): void {
@@ -897,11 +929,29 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       await this._service.approveTransfer(pagoId);
       console.log('Estado actualizado a Aprobado');
       console.log('Transferencia aprobada correctamente');
+
+      let mensajeExito = 'Transferencia aprobada correctamente.';
+      let errorRecibo = '';
+      if (
+        debeGenerarReciboPago({
+          tipoPago: this._normalizarTipoPago(this.state.tipoPago) || 'Ingreso',
+          estado: 'Aprobado',
+          motivo: 'aprobacion'
+        })
+      ) {
+        const reciboOk = await this._generarYAdjuntarRecibo(pagoId);
+        if (!reciboOk) {
+          errorRecibo =
+            'La transferencia fue aprobada, pero el recibo no pudo generarse. Puede regenerarlo o contactar al administrador.';
+        }
+      }
+
       this.setState({
         estado: 'Aprobado',
         aprobando: false,
         mostrarDialogoAprobacion: false,
-        mensajeExito: 'Transferencia aprobada correctamente.'
+        mensajeExito: errorRecibo ? '' : mensajeExito,
+        error: errorRecibo
       });
     } catch (error) {
       this.setState({
@@ -1020,18 +1070,18 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
           )[0];
           if (servicio) {
             servicioAsociadoId = servicio.id;
-            concepto = servicio.concepto;
+            concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
             conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
           } else if (conceptoGuardado) {
             concepto = conceptoGuardado;
           }
         } else if (conceptoGuardado) {
-          const servicio = serviciosViaje.filter(
-            (item: IServicioViajeItem) => item.concepto === conceptoGuardado
+          const servicio = serviciosViaje.filter((item: IServicioViajeItem) =>
+            servicioCoincideConConceptoGuardado(item.concepto, conceptoGuardado, viajeTitulo)
           )[0];
           if (servicio) {
             servicioAsociadoId = servicio.id;
-            concepto = servicio.concepto;
+            concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
             conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
           } else {
             concepto = conceptoGuardado;
@@ -1079,6 +1129,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         opcionesBanco,
         opcionesMotivo,
         fechaPago,
+        fechaPagoTexto: fechaTextoDesdeValor(fechaPago),
         monto: pago.monto > 0 ? String(pago.monto) : '',
         moneda,
         cotizacion: pago.cotizacion !== undefined && pago.cotizacion > 0 ? String(pago.cotizacion) : '',
@@ -1223,7 +1274,9 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       : false;
     this.setState({
       servicioAsociadoId: servicioId,
-      concepto: servicio ? servicio.concepto : '',
+      concepto: servicio
+        ? buildConceptoPagoConViaje(servicio.concepto, this.state.viajeTitulo)
+        : '',
       conceptoMoneda,
       cotizacion: requiereCotizacion ? this.state.cotizacion : '',
       fieldErrors: {
@@ -1234,6 +1287,14 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       }
     });
   };
+
+  private _resolverConceptoAsociadoAViajeParaGuardar(): string {
+    const servicio = this._getServicioSeleccionado();
+    if (servicio) {
+      return buildConceptoPagoConViaje(servicio.concepto, this.state.viajeTitulo);
+    }
+    return (this.state.concepto || '').trim();
+  }
 
   private _onCambiarPasajeroViaje = (event: React.ChangeEvent<HTMLSelectElement>): void => {
     const pasajeroId = Number(event.target.value) || null;
@@ -1284,12 +1345,149 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     this.setState({ motivo: event.target.value });
   };
 
-  private _onCambiarFechaPago = (event: React.ChangeEvent<HTMLInputElement>): void => {
-    this.setState({
-      fechaPago: getDateOnlyFromSharePoint(event.target.value),
-      fieldErrors: { ...this.state.fieldErrors, fechaPago: '' }
+  private _patchFormDateInputRef = (field: ITextField | null): void => {
+    if (!field) {
+      return;
+    }
+    const input = (field as { inputElement?: HTMLInputElement | null }).inputElement;
+    if (!input || input.dataset.formDateClickPatched === '1') {
+      return;
+    }
+    input.dataset.formDateClickPatched = '1';
+    input.addEventListener('click', (event: MouseEvent) => {
+      event.stopPropagation();
     });
   };
+
+  private _onKeyDownFormDatePickerCapture = (
+    ev: React.KeyboardEvent<HTMLDivElement>,
+    onBlurTexto: () => void
+  ): void => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      onBlurTexto();
+      const target = ev.target as HTMLElement;
+      if (target && typeof target.blur === 'function') {
+        target.blur();
+      }
+    }
+  };
+
+  private _onBlurTextoFechaGenerico(
+    value: string,
+    texto: string,
+    onUpdate: (fecha: string, texto: string) => void
+  ): void {
+    const digits = (texto || '').replace(/\D/g, '');
+    if (!digits || digits.length === 8) {
+      return;
+    }
+    onUpdate(value, fechaTextoDesdeValor(value));
+  }
+
+  private _onCambiarTextoFechaGenerico(
+    _ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue: string | undefined,
+    onUpdate: (fecha: string, texto: string) => void
+  ): void {
+    const textoEnmascarado = aplicarMascaraFecha(newValue || '');
+    const digits = textoEnmascarado.replace(/\D/g, '');
+    let fecha = '';
+    if (digits.length === 8) {
+      const parsed = parseDateFromPickerString(textoEnmascarado);
+      fecha = parsed ? dateToInputString(parsed) : '';
+    }
+    onUpdate(fecha, textoEnmascarado);
+  };
+
+  private _onSeleccionarFechaPago = (date: Date | null | undefined): void => {
+    const fechaPago = date ? dateToInputString(date) : '';
+    const fechaPagoTexto = date ? formatDateForPicker(date) : '';
+    this.setState((prev) => ({
+      fechaPago,
+      fechaPagoTexto,
+      fieldErrors: { ...prev.fieldErrors, fechaPago: '' }
+    }));
+  };
+
+  private _onCambiarTextoFechaPago = (
+    ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>,
+    newValue?: string
+  ): void => {
+    this._onCambiarTextoFechaGenerico(ev, newValue, (fecha: string, texto: string) => {
+      this.setState((prev) => ({
+        fechaPago: fecha,
+        fechaPagoTexto: texto,
+        fieldErrors: { ...prev.fieldErrors, fechaPago: '' }
+      }));
+    });
+  };
+
+  private _onBlurTextoFechaPago = (): void => {
+    this._onBlurTextoFechaGenerico(
+      this.state.fechaPago,
+      this.state.fechaPagoTexto,
+      (fecha: string, texto: string) => {
+        this.setState({ fechaPago: fecha, fechaPagoTexto: texto });
+      }
+    );
+  };
+
+  private _renderFormDatePicker(
+    value: string,
+    textoValue: string,
+    onSelectDate: (date: Date | null | undefined) => void,
+    onChangeTexto: (ev: React.FormEvent<HTMLInputElement | HTMLTextAreaElement>, newValue?: string) => void,
+    onBlurTexto: () => void,
+    hasError?: boolean
+  ): React.ReactNode {
+    return (
+      <div
+        style={{ width: '100%' }}
+        onKeyDownCapture={(ev: React.KeyboardEvent<HTMLDivElement>) =>
+          this._onKeyDownFormDatePickerCapture(ev, onBlurTexto)
+        }
+      >
+        <DatePicker
+          value={parseDateStringToDate(value)}
+          onSelectDate={onSelectDate}
+          formatDate={(date: Date) => formatDateForPicker(date)}
+          parseDateFromString={(dateStr: string) =>
+            parseDateFromPickerString(aplicarMascaraFecha(dateStr))
+          }
+          placeholder="dd/mm/aaaa"
+          allowTextInput={true}
+          openOnClick={false}
+          disableAutoFocus={true}
+          strings={FORM_DATE_PICKER_STRINGS}
+          firstDayOfWeek={DayOfWeek.Monday}
+          disabled={this.state.guardando}
+          styles={{ root: { width: '100%' } }}
+          textField={{
+            value: textoValue,
+            onChange: onChangeTexto,
+            onBlur: onBlurTexto,
+            componentRef: this._patchFormDateInputRef,
+            inputMode: 'numeric',
+            maxLength: 10,
+            styles: {
+              fieldGroup: {
+                height: 38,
+                borderRadius: 8,
+                border: hasError ? '1.4px solid #a4262c' : '1.4px solid #CDD0D7',
+                background: '#FAFAFC'
+              },
+              field: {
+                fontSize: 15,
+                color: '#232529'
+              }
+            }
+          }}
+        />
+      </div>
+    );
+  }
 
   private _onCambiarMonto = (event: React.ChangeEvent<HTMLInputElement>): void => {
     this.setState({
@@ -1508,6 +1706,128 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     return true;
   };
 
+  private _obtenerDatosReciboDesdeFormulario(): {
+    nombreApellido: string;
+    dni: string;
+    concepto: string;
+    fechaPago: string;
+    monto: number;
+    moneda: string;
+    formaPago: string;
+  } {
+    let nombreApellido = '';
+    let dni = '';
+
+    if (this._esAsociadoAViaje()) {
+      const pasajeroId = this.state.pasajeroId;
+      const pasajero = this.state.pasajerosViaje.filter(
+        (item: IPasajeroLookupItem) => item.id === pasajeroId
+      )[0];
+      nombreApellido = pasajero ? pasajero.nombreApellido : this.state.pasajeroTitulo;
+      dni = pasajero ? pasajero.dni : '';
+    } else {
+      nombreApellido = this.state.pasajeroNombre;
+      dni = this.state.pasajeroDni;
+    }
+
+    return {
+      nombreApellido,
+      dni,
+      concepto: this._esAsociadoAViaje()
+        ? this._resolverConceptoAsociadoAViajeParaGuardar()
+        : this.state.motivo,
+      fechaPago: this.state.fechaPago,
+      monto: Number(this.state.monto),
+      moneda: this.state.moneda,
+      formaPago: this.state.medioPago
+    };
+  }
+
+  private async _generarYAdjuntarRecibo(
+    itemId: number,
+    opciones?: { regenerar?: boolean }
+  ): Promise<boolean> {
+    const datos = this._obtenerDatosReciboDesdeFormulario();
+    try {
+      const payload = {
+        itemId,
+        fechaPago: datos.fechaPago,
+        nombreApellido: datos.nombreApellido,
+        dni: datos.dni,
+        concepto: datos.concepto,
+        monto: datos.monto,
+        moneda: datos.moneda,
+        formaPago: datos.formaPago
+      };
+      const resultado = opciones && opciones.regenerar
+        ? await this._reciboService.regenerarRecibo(payload)
+        : await this._reciboService.generarYAdjuntarRecibo(payload);
+
+      if (!resultado.skipped) {
+        await this._refrescarComprobantes(itemId);
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[RegistroPagosForm] Error al generar o adjuntar el recibo de pago:', error);
+      if (error instanceof Error) {
+        console.error('[RegistroPagosForm] Detalle:', error.message);
+        if (error.stack) {
+          console.error(error.stack);
+        }
+      }
+      return false;
+    }
+  }
+
+  private _onRegenerarRecibo = async (): Promise<void> => {
+    const itemId = this.state.pagoId;
+    if (!itemId || this._esSoloLectura() || this.props.displayMode !== FormDisplayMode.Edit) {
+      return;
+    }
+
+    const confirmar = window.confirm(
+      '¿Desea regenerar el recibo de pago? Se utilizarán los datos actuales del formulario y se reemplazará el archivo existente.'
+    );
+    if (!confirmar) {
+      return;
+    }
+
+    const datos = this._obtenerDatosReciboDesdeFormulario();
+    try {
+      this.setState({ reciboGenerando: true, error: '', mensajeExito: '' });
+
+      const resultado = await this._reciboService.regenerarRecibo({
+        itemId,
+        fechaPago: datos.fechaPago,
+        nombreApellido: datos.nombreApellido,
+        dni: datos.dni,
+        concepto: datos.concepto,
+        monto: datos.monto,
+        moneda: datos.moneda,
+        formaPago: datos.formaPago
+      });
+
+      await this._refrescarComprobantes(itemId);
+      this.setState({
+        mensajeExito: 'Recibo regenerado correctamente (' + resultado.fileName + ').'
+      });
+    } catch (error) {
+      console.error('[RegistroPagosForm] Error al regenerar el recibo de pago:', error);
+      if (error instanceof Error) {
+        console.error('[RegistroPagosForm] Detalle:', error.message);
+        if (error.stack) {
+          console.error(error.stack);
+        }
+      }
+      this.setState({
+        error: 'No se pudo regenerar el recibo de pago. Verifique la plantilla y los datos del formulario.'
+      });
+    } finally {
+      this.setState({ reciboGenerando: false });
+    }
+  };
+
   private _eliminarComprobante = async (fileName: string): Promise<void> => {
     if (this._esSoloLectura() || !this.state.pagoId) {
       return;
@@ -1683,13 +2003,29 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         console.log('Pasajero resuelto para pago sin viaje: ' + pasajeroId);
       }
 
+      const conceptoParaGuardar = this._esAsociadoAViaje()
+        ? this._resolverConceptoAsociadoAViajeParaGuardar()
+        : undefined;
+      // TEMP diagnóstico Concepto — quitar cuando se confirme la causa
+      if (this._esAsociadoAViaje()) {
+        const servicioDiag = this._getServicioSeleccionado();
+        console.log('[Concepto pago] origen=RegistroPagosForm');
+        console.log(
+          '[Concepto pago] servicio:',
+          servicioDiag ? servicioDiag.concepto : '(sin servicio)'
+        );
+        console.log('[Concepto pago] viaje:', this.state.viajeTitulo);
+        console.log('[Concepto pago] concepto generado:', conceptoParaGuardar);
+        console.log('[Concepto pago] state.concepto:', this.state.concepto);
+      }
+
       const data = {
         tipoPago: this._normalizarTipoPago(this.state.tipoPago) || 'Ingreso',
         viajeId: this._esAsociadoAViaje() ? (this.state.viajeId as number) : null,
         viajeTitulo: this._esAsociadoAViaje() ? this.state.viajeTitulo : '',
         pasajeroId,
         pasajeroNombre,
-        concepto: this._esAsociadoAViaje() ? this.state.concepto : undefined,
+        concepto: conceptoParaGuardar,
         medioPago: this.state.medioPago,
         fechaPago: this.state.fechaPago,
         monto: Number(this.state.monto),
@@ -1701,6 +2037,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         servicioAsociadoId: this._resolverServicioAsociadoIdParaGuardar()
       };
 
+      const esCreacion = !this.state.pagoId;
       let itemId = this.state.pagoId;
       if (itemId) {
         await this._service.updatePago(itemId, data);
@@ -1711,7 +2048,27 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       }
 
       const comprobantesOk = await this._subirComprobantesPendientes(itemId);
+      let reciboOk = true;
+      if (
+        debeGenerarReciboPago({
+          tipoPago: data.tipoPago,
+          estado,
+          motivo: esCreacion ? 'creacion' : 'edicion'
+        })
+      ) {
+        reciboOk = await this._generarYAdjuntarRecibo(itemId, { regenerar: !esCreacion });
+      }
+
       if (!comprobantesOk) {
+        return;
+      }
+
+      if (!reciboOk) {
+        this.setState({
+          error: esCreacion
+            ? 'El pago fue guardado correctamente, pero el recibo no pudo generarse. Puede intentar guardar nuevamente o contactar al administrador.'
+            : 'El pago fue actualizado correctamente, pero el recibo no pudo regenerarse. Puede usar Regenerar recibo o contactar al administrador.'
+        });
         return;
       }
 
@@ -1805,28 +2162,58 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
   private _renderSeccionComprobantes(soloLectura: boolean): React.ReactNode {
     const listaVacia =
       this.state.comprobantes.length === 0 && this.state.comprobantesPendientes.length === 0;
+    const mostrarRegenerarRecibo =
+      !soloLectura &&
+      this.props.displayMode === FormDisplayMode.Edit &&
+      !!this.state.pagoId;
+    const accionesDeshabilitadas =
+      this.state.guardando ||
+      this.state.comprobantesSubiendo ||
+      this.state.reciboGenerando;
 
     return (
       <div style={layoutStyles.section}>
         <div style={layoutStyles.sectionToolbar}>
           <div style={layoutStyles.toolbarTitle}>Comprobantes</div>
           {!soloLectura && (
-            <button
-              type="button"
-              style={
-                this.state.guardando || this.state.comprobantesSubiendo
-                  ? { ...layoutStyles.defaultButton, ...layoutStyles.buttonDisabled }
-                  : layoutStyles.defaultButton
-              }
-              onClick={this._abrirEditorComprobante}
-              disabled={this.state.guardando || this.state.comprobantesSubiendo}
-            >
-              Subir comprobantes
-            </button>
+            <div style={layoutStyles.sectionToolbarActions}>
+              {mostrarRegenerarRecibo && (
+                <button
+                  type="button"
+                  style={
+                    accionesDeshabilitadas
+                      ? { ...layoutStyles.defaultButton, ...layoutStyles.buttonDisabled }
+                      : layoutStyles.defaultButton
+                  }
+                  onClick={() => {
+                    void this._onRegenerarRecibo();
+                  }}
+                  disabled={accionesDeshabilitadas}
+                >
+                  {this.state.reciboGenerando ? 'Regenerando recibo...' : 'Regenerar recibo'}
+                </button>
+              )}
+              <button
+                type="button"
+                style={
+                  accionesDeshabilitadas
+                    ? { ...layoutStyles.defaultButton, ...layoutStyles.buttonDisabled }
+                    : layoutStyles.defaultButton
+                }
+                onClick={this._abrirEditorComprobante}
+                disabled={accionesDeshabilitadas}
+              >
+                Subir comprobantes
+              </button>
+            </div>
           )}
         </div>
 
         {this.state.comprobantesError && <div style={layoutStyles.error}>{this.state.comprobantesError}</div>}
+
+        {this.state.reciboGenerando && (
+          <div style={layoutStyles.info}>Generando recibo de pago...</div>
+        )}
 
         {!soloLectura && !this.state.pagoId && this.state.comprobantesPendientes.length > 0 && (
           <div style={layoutStyles.info}>
@@ -2397,22 +2784,14 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                     {formatDateDisplay(this.state.fechaPago) || '—'}
                   </div>
                 ) : (
-                  <div style={layoutStyles.dateInputWrap}>
-                    <input
-                      type="date"
-                      lang="es-AR"
-                      style={{
-                        ...layoutStyles.dateInput,
-                        ...(this.state.fieldErrors.fechaPago ? layoutStyles.dateInputError : {})
-                      }}
-                      value={getDateOnlyFromSharePoint(this.state.fechaPago)}
-                      onChange={this._onCambiarFechaPago}
-                      disabled={this.state.guardando}
-                    />
-                    <div style={layoutStyles.dateInputOverlay}>
-                      {formatDateDisplay(this.state.fechaPago)}
-                    </div>
-                  </div>
+                  this._renderFormDatePicker(
+                    this.state.fechaPago,
+                    this.state.fechaPagoTexto,
+                    this._onSeleccionarFechaPago,
+                    this._onCambiarTextoFechaPago,
+                    this._onBlurTextoFechaPago,
+                    !!(this.state.fieldErrors.fechaPago || '').trim()
+                  )
                 )}
                 {this._renderFieldError(this.state.fieldErrors.fechaPago)}
               </div>

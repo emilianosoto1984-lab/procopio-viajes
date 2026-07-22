@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Recibo de Pago</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #1f1f1f;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .receipt-page {
+      width: 760px;
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 36px 40px;
+      background: #ffffff;
+    }
+
+    .logo-container {
+      width: 100%;
+      text-align: center;
+      margin-bottom: 16px;
+      overflow: visible;
+    }
+
+    .logo-container img {
+      width: 100%;
+      max-width: 720px;
+      height: auto;
+      object-fit: contain;
+      display: block;
+      margin: 0 auto;
+    }
+
+    .company-grid {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0 0 18px 0;
+      table-layout: fixed;
+    }
+
+    .company-grid td {
+      width: 50%;
+      padding: 4px 8px 4px 0;
+      vertical-align: top;
+      font-size: 12px;
+      color: #333333;
+    }
+
+    .company-grid .label {
+      font-weight: bold;
+      color: #222222;
+    }
+
+    .title-wrap {
+      text-align: center;
+      margin: 22px 0 18px 0;
+      padding: 0 0 10px 0;
+      border-bottom: 2px solid #2b2b2b;
+    }
+
+    .title-wrap h1 {
+      margin: 0;
+      padding: 0;
+      font-size: 24px;
+      font-weight: bold;
+      letter-spacing: 3px;
+      color: #111111;
+    }
+
+    .recibo-box {
+      width: 100%;
+      border: 1px solid #c8c8c8;
+      background: #fafafa;
+      padding: 0;
+      margin: 0;
+    }
+
+    .recibo-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    .recibo-table tr {
+      border-bottom: 1px solid #dddddd;
+    }
+
+    .recibo-table tr:last-child {
+      border-bottom: none;
+    }
+
+    .recibo-table td {
+      padding: 10px 14px;
+      vertical-align: top;
+    }
+
+    .recibo-label {
+      width: 210px;
+      font-weight: bold;
+      color: #333333;
+      background: #f0f0f0;
+    }
+
+    .recibo-value {
+      color: #111111;
+      word-wrap: break-word;
+    }
+
+    .recibo-value.monto {
+      font-size: 15px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="receipt-page">
+    <div class="logo-container">
+      <img src="{{LogoEmpresa}}" alt="Procopio Turismo">
+    </div>
+
+    <table class="company-grid">
+      <tr>
+        <td><span class="label">CUIT:</span> 30-00000000-0</td>
+        <td><span class="label">Dirección:</span> Av. Corrientes 1234, CABA</td>
+      </tr>
+      <tr>
+        <td><span class="label">WhatsApp:</span> +54 9 11 0000-0000</td>
+        <td><span class="label">Teléfono:</span> (011) 0000-0000</td>
+      </tr>
+    </table>
+
+    <div class="title-wrap">
+      <h1>RECIBO</h1>
+    </div>
+
+    <div class="recibo-box">
+      <table class="recibo-table">
+        <tr>
+          <td class="recibo-label">Número de recibo</td>
+          <td class="recibo-value">{{NumeroRecibo}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">Fecha</td>
+          <td class="recibo-value">{{Fecha}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">Nombre y Apellido</td>
+          <td class="recibo-value">{{NombreApellido}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">DNI</td>
+          <td class="recibo-value">{{DNI}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">Concepto</td>
+          <td class="recibo-value">{{Concepto}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">Monto</td>
+          <td class="recibo-value monto">{{Monto}}</td>
+        </tr>
+        <tr>
+          <td class="recibo-label">Forma de pago</td>
+          <td class="recibo-value">{{FormaPago}}</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

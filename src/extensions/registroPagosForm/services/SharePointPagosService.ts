@@ -1,9 +1,22 @@
 import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import { SPHttpClient, SPHttpClientResponse } from '@microsoft/sp-http';
-import { toDateInput, toSharePointDateOnlyPayload } from '../../../shared/sharePointDateUtils';
 import { IPagoSaldoItem } from '../../../shared/pagoSaldoUtils';
+import {
+  buildRegistroPagoExpandFields,
+  buildRegistroPagoSelectFields,
+  IRegistroPagoFieldMap,
+  ISharePointListFieldMeta,
+  resolveRegistroPagoFieldMap
+} from '../../../shared/registroPagoFieldMap';
+import {
+  buildRegistroPagoPayload,
+  mapSharePointItemToRegistroPago,
+  normalizarTipoPagoRegistro
+} from '../../../shared/registroPagoPayload';
+import { IRegistroPagoPayload } from '../../../shared/registroPagoTypes';
 
 export { IPagoSaldoItem };
+export { getEstadoByMedioPago } from '../../../shared/pagoMedioUtils';
 
 export interface IRegistroPagoData {
   tipoPago: string;
@@ -21,18 +34,6 @@ export interface IRegistroPagoData {
   pasajeroNombre?: string;
   concepto?: string;
   servicioAsociadoId?: number;
-}
-
-export function getEstadoByMedioPago(medioPago: string): string {
-  switch ((medioPago || '').trim()) {
-    case 'Efectivo':
-      return 'Aprobado';
-    case 'Transferencia':
-    case 'Tarjeta de Credito':
-      return 'Pendiente';
-    default:
-      return 'Pendiente';
-  }
 }
 
 export interface IRegistroPagoItem extends IRegistroPagoData {
@@ -87,6 +88,7 @@ export default class SharePointPagosService {
   private readonly _context: FormCustomizerContext;
   private readonly _webUrl: string;
   private _fieldMaps: { [listTitle: string]: IStringMap } = {};
+  private _registroPagoFieldMap: IRegistroPagoFieldMap | undefined;
 
   public constructor(context: FormCustomizerContext) {
     this._context = context;
@@ -95,31 +97,8 @@ export default class SharePointPagosService {
 
   public async getPagoById(id: number): Promise<IRegistroPagoItem> {
     const map = await this._getPagosFieldMap();
-    const lookupField = map.ViajeAsociado;
-    const pasajeroField = map.Pasajero;
-    const montoField = map.Monto;
-    const servicioLookup = map.ServicioViaje;
-    const selectFields = [
-      'Id',
-      montoField,
-      map.MedioPago,
-      map.Moneda,
-      map.Estado,
-      map.FechaPago,
-      map.Cotizacion,
-      map.Banco,
-      map.Motivo,
-      map.TipoPago,
-      map.Concepto,
-      lookupField + '/Id',
-      lookupField + '/Title',
-      pasajeroField + '/Id',
-      pasajeroField + '/Title',
-      servicioLookup + '/Id'
-    ];
-    const expandFields = [lookupField, pasajeroField, servicioLookup].filter(
-      (field: string, index: number, fields: string[]) => fields.indexOf(field) === index
-    );
+    const selectFields = buildRegistroPagoSelectFields(map);
+    const expandFields = buildRegistroPagoExpandFields(map);
     const url = this._buildUrl(
       "/_api/web/lists/getByTitle('Registro de Pagos')/items(" +
         id +
@@ -129,36 +108,37 @@ export default class SharePointPagosService {
         encodeURIComponent(expandFields.join(','))
     );
     const item: any = await this._get(url);
-    const viajeId = this._extractLookupId(item, lookupField);
-    const viajeTitulo = item[lookupField] ? this._getString(item[lookupField], 'Title') : '';
-    const pasajeroId = this._extractLookupId(item, pasajeroField);
-    const servicioAsociadoId = this._extractLookupId(item, servicioLookup);
+    const shared = mapSharePointItemToRegistroPago(item, map);
+    const viajeTitulo = item[map.ViajeAsociado]
+      ? this._getString(item[map.ViajeAsociado], 'Title')
+      : '';
 
     return {
-      id: item.Id,
-      viajeId: viajeId > 0 ? viajeId : null,
+      id: shared.id,
+      viajeId: shared.viajeAsociadoId,
       viajeTitulo,
-      pasajeroId,
-      tipoPago: this._normalizarTipoPago(this._getString(item, map.TipoPago)),
-      servicioAsociadoId: servicioAsociadoId > 0 ? servicioAsociadoId : undefined,
-      concepto: this._getConceptoPago(item, map),
-      medioPago: this._getString(item, map.MedioPago),
-      monto: this._leerMontoPago(item, montoField, map),
-      moneda: this._getString(item, map.Moneda),
-      estado: this._getString(item, map.Estado),
-      fechaPago: toDateInput(this._getString(item, map.FechaPago)),
-      banco: this._getString(item, map.Banco),
-      motivo: this._getString(item, map.Motivo),
-      cotizacion:
-        item[map.Cotizacion] !== undefined && item[map.Cotizacion] !== null
-          ? this._toNumber(item[map.Cotizacion])
-          : undefined
+      pasajeroId: shared.pasajeroId || 0,
+      tipoPago: shared.tipoPago,
+      servicioAsociadoId: shared.servicioViajeId,
+      concepto: shared.concepto,
+      medioPago: shared.medioPago,
+      monto: shared.monto,
+      moneda: shared.moneda,
+      estado: shared.estado || '',
+      fechaPago: shared.fechaPago,
+      banco: shared.banco,
+      motivo: shared.motivo,
+      cotizacion: shared.cotizacion
     };
   }
 
   public async createPago(data: IRegistroPagoData): Promise<IRegistroPagoItem> {
     const map = await this._getPagosFieldMap();
-    const payload = this._buildPagoPayload(map, data);
+    const shared = this._toSharedPayload(data);
+    const payload = buildRegistroPagoPayload(shared, map);
+    // TEMP diagnóstico Concepto
+    console.log('[Concepto pago] SharePointPagosService.createPago shared:', shared);
+    console.log('[Concepto pago] SharePointPagosService.createPago payload:', payload);
     const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items");
     const created = await this._post(url, payload);
     return {
@@ -166,7 +146,7 @@ export default class SharePointPagosService {
       viajeId: data.viajeId,
       viajeTitulo: data.viajeTitulo,
       pasajeroId: data.pasajeroId,
-      tipoPago: this._normalizarTipoPago(data.tipoPago),
+      tipoPago: normalizarTipoPagoRegistro(data.tipoPago),
       concepto: data.concepto,
       medioPago: data.medioPago,
       monto: data.monto,
@@ -183,7 +163,11 @@ export default class SharePointPagosService {
 
   public async updatePago(id: number, data: IRegistroPagoData): Promise<void> {
     const map = await this._getPagosFieldMap();
-    const payload = this._buildPagoPayload(map, data);
+    const shared = this._toSharedPayload(data);
+    const payload = buildRegistroPagoPayload(shared, map);
+    // TEMP diagnóstico Concepto
+    console.log('[Concepto pago] SharePointPagosService.updatePago shared:', shared);
+    console.log('[Concepto pago] SharePointPagosService.updatePago payload:', payload);
     const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items(" + id + ')');
     await this._post(url, payload, {
       'X-HTTP-Method': 'MERGE',
@@ -193,6 +177,9 @@ export default class SharePointPagosService {
 
   public async approveTransfer(id: number): Promise<void> {
     const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Estado) {
+      throw new Error('La columna Estado no existe en la lista Registro de Pagos.');
+    }
     const payload: { [key: string]: string } = {};
     payload[map.Estado] = 'Aprobado';
     const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items(" + id + ')');
@@ -427,25 +414,8 @@ export default class SharePointPagosService {
   public async getPagosSaldoByViaje(viajeId: number): Promise<IPagoSaldoItem[]> {
     const map = await this._getPagosFieldMap();
     const lookupField = map.ViajeAsociado;
-    const montoField = map.Monto;
-    const servicioLookup = map.ServicioViaje;
-    const selectFields = [
-      'Id',
-      'Title',
-      map.Concepto,
-      montoField,
-      map.Moneda,
-      map.TipoPago,
-      map.Cotizacion,
-      lookupField + '/Id',
-      servicioLookup + '/Id'
-    ];
-    if (map.Importe && map.Importe !== montoField) {
-      selectFields.push(map.Importe);
-    }
-    const expandFields = [lookupField, servicioLookup].filter(
-      (field: string, index: number, fields: string[]) => fields.indexOf(field) === index
-    );
+    const selectFields = buildRegistroPagoSelectFields(map);
+    const expandFields = buildRegistroPagoExpandFields(map);
     const baseUrl =
       "/_api/web/lists/getByTitle('" +
       LISTA_PAGOS +
@@ -469,19 +439,15 @@ export default class SharePointPagosService {
 
     const values = this._getResults(json);
     return values.map((item: any) => {
-      const servicioAsociadoId = this._extractLookupId(item, servicioLookup);
-      const tipoPagoLeido = this._getString(item, map.TipoPago);
+      const shared = mapSharePointItemToRegistroPago(item, map);
       return {
-        id: item.Id,
-        tipoPago: this._normalizarTipoPago(tipoPagoLeido),
-        monto: this._leerMontoPago(item, montoField, map),
-        moneda: this._getString(item, map.Moneda),
-        cotizacion:
-          item[map.Cotizacion] !== undefined && item[map.Cotizacion] !== null
-            ? this._toNumber(item[map.Cotizacion])
-            : undefined,
-        servicioAsociadoId: servicioAsociadoId > 0 ? servicioAsociadoId : undefined,
-        concepto: this._getConceptoPago(item, map)
+        id: shared.id,
+        tipoPago: shared.tipoPago,
+        monto: shared.monto,
+        moneda: shared.moneda,
+        cotizacion: shared.cotizacion,
+        servicioAsociadoId: shared.servicioViajeId,
+        concepto: shared.concepto
       };
     });
   }
@@ -507,103 +473,63 @@ export default class SharePointPagosService {
 
   public async getBancoChoices(): Promise<string[]> {
     const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Banco) {
+      return [];
+    }
     return this.getChoiceFieldOptions(LISTA_PAGOS, map.Banco || 'Banco');
   }
 
   public async getMotivoChoices(): Promise<string[]> {
     const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Motivo) {
+      return [];
+    }
     return this.getChoiceFieldOptions(LISTA_PAGOS, map.Motivo || 'Motivo');
   }
 
-  private _buildPagoPayload(map: IStringMap, data: IRegistroPagoData): { [key: string]: string | number | null } {
-    const payload: { [key: string]: string | number | null } = {};
+  private _toSharedPayload(data: IRegistroPagoData): IRegistroPagoPayload {
     const tituloViaje = (data.viajeTitulo || '').trim();
     const tituloPasajero = (data.pasajeroNombre || '').trim();
-    const titulo = tituloViaje || tituloPasajero || 'Registro de Pago';
-    payload.Title = titulo;
-    if (data.concepto && data.concepto.trim()) {
-      payload[map.Concepto] = data.concepto.trim();
-    } else {
-      payload[map.Concepto] = null;
-    }
-    if (data.viajeId && data.viajeId > 0) {
-      payload[map.ViajeAsociado + 'Id'] = data.viajeId;
-    } else {
-      payload[map.ViajeAsociado + 'Id'] = null;
-    }
-    payload[map.Pasajero + 'Id'] = data.pasajeroId > 0 ? data.pasajeroId : null;
-    payload[map.TipoPago] = this._normalizarTipoPago(data.tipoPago);
-    payload[map.Monto] = data.monto;
-    payload[map.MedioPago] = data.medioPago;
-    payload[map.Moneda] = data.moneda;
-    payload[map.Estado] = data.estado;
-    const fechaPagoPayload = toSharePointDateOnlyPayload(data.fechaPago);
-    console.log('FechaPago preparada para guardar:', fechaPagoPayload);
-    payload[map.FechaPago] = fechaPagoPayload;
-    if (data.banco && data.banco.trim()) {
-      payload[map.Banco] = data.banco;
-    } else {
-      payload[map.Banco] = null;
-    }
-    if (data.motivo && data.motivo.trim()) {
-      payload[map.Motivo] = data.motivo;
-    } else {
-      payload[map.Motivo] = null;
-    }
-    if (data.cotizacion !== undefined && data.cotizacion !== null) {
-      payload[map.Cotizacion] = data.cotizacion > 0 ? data.cotizacion : null;
-    } else {
-      payload[map.Cotizacion] = null;
-    }
-    const servicioKey = map.ServicioViaje + 'Id';
+    const shared: IRegistroPagoPayload = {
+      title: tituloViaje || tituloPasajero || 'Registro de Pago',
+      concepto: data.concepto && data.concepto.trim() ? data.concepto.trim() : null,
+      monto: data.monto,
+      tipoPago: data.tipoPago,
+      medioPago: data.medioPago,
+      fechaPago: data.fechaPago,
+      moneda: data.moneda,
+      estado: data.estado,
+      banco: data.banco && data.banco.trim() ? data.banco : null,
+      motivo: data.motivo && data.motivo.trim() ? data.motivo : null,
+      cotizacion:
+        data.cotizacion !== undefined && data.cotizacion !== null && data.cotizacion > 0
+          ? data.cotizacion
+          : null,
+      viajeAsociadoId: data.viajeId && data.viajeId > 0 ? data.viajeId : null,
+      pasajeroId: data.pasajeroId > 0 ? data.pasajeroId : null
+    };
+
     if (data.servicioAsociadoId !== undefined) {
-      if (data.servicioAsociadoId > 0) {
-        payload[servicioKey] = data.servicioAsociadoId;
-      } else {
-        payload[servicioKey] = null;
-      }
+      shared.servicioViajeId = data.servicioAsociadoId > 0 ? data.servicioAsociadoId : null;
     }
-    return payload;
+
+    return shared;
   }
 
-  private async _getPagosFieldMap(): Promise<IStringMap> {
-    const map = await this._getFieldMap(LISTA_PAGOS, {
-      ViajeAsociado: 'ViajeAsociado',
-      // Lookup a lista Pasajeros. Crear el campo en SharePoint si aún no existe (InternalName: Pasajero).
-      Pasajero: 'Pasajero',
-      Monto: 'Monto',
-      MedioPago: 'MedioPago',
-      Moneda: 'Moneda',
-      Estado: 'Estado',
-      FechaPago: 'FechaPago',
-      Cotizacion: 'Cotizacion',
-      Banco: 'Banco',
-      Motivo: 'Motivo',
-      TipoPago: 'TipoPago',
-      Concepto: 'Concepto',
-      ServicioViaje: 'ServicioViaje'
-    }, {
-      Banco: 'Cuenta Bancaria',
-      Motivo: 'Motivo de elección'
-    });
-
-    const fieldsUrl = this._buildUrl(
-      "/_api/web/lists/getByTitle('" + LISTA_PAGOS + "')/fields?$select=Title,InternalName&$filter=Hidden eq false"
-    );
-    const json: any = await this._get(fieldsUrl);
-    const fields: any[] = this._getResults(json);
-    const importeField = fields.filter((field) => field.Title === 'Importe' || field.InternalName === 'Importe')[0];
-    if (importeField) {
-      map.Importe = importeField.InternalName;
-      if (!map.Monto || map.Monto === 'Monto') {
-        const montoField = fields.filter((field) => field.InternalName === 'Monto' || field.Title === 'Monto')[0];
-        if (!montoField) {
-          map.Monto = importeField.InternalName;
-        }
-      }
+  private async _getPagosFieldMap(): Promise<IRegistroPagoFieldMap> {
+    if (this._registroPagoFieldMap) {
+      return this._registroPagoFieldMap;
     }
 
-    return map;
+    const fieldsUrl = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_PAGOS +
+        "')/fields?$select=Title,InternalName,TypeAsString,Hidden"
+    );
+    const json: any = await this._get(fieldsUrl);
+    const fields: ISharePointListFieldMeta[] = this._getResults(json);
+    this._registroPagoFieldMap = resolveRegistroPagoFieldMap(fields);
+    return this._registroPagoFieldMap;
   }
 
   private async _getViajesFieldMap(): Promise<IStringMap> {
@@ -806,33 +732,6 @@ export default class SharePointPagosService {
   private _toNumber(value: any): number {
     const parsed = Number(value);
     return isNaN(parsed) ? 0 : parsed;
-  }
-
-  private _getConceptoPago(item: any, map: IStringMap): string {
-    const concepto = this._getString(item, map.Concepto).trim();
-    if (concepto) {
-      return concepto;
-    }
-    return this._getString(item, 'Title').trim();
-  }
-
-  private _leerMontoPago(item: any, montoField: string, map: IStringMap): number {
-    const montoPrincipal = this._toNumber(item[montoField]);
-    if (montoPrincipal > 0) {
-      return montoPrincipal;
-    }
-    const importeField = map.Importe || 'Importe';
-    if (importeField !== montoField) {
-      const importe = this._toNumber(item[importeField]);
-      if (importe > 0) {
-        return importe;
-      }
-    }
-    return montoPrincipal;
-  }
-
-  private _normalizarTipoPago(value: string): string {
-    return (value || '').trim() === 'Egreso' ? 'Egreso' : 'Ingreso';
   }
 
   private _getString(source: any, key: string): string {

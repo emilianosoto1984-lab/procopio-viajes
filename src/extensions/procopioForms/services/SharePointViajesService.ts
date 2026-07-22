@@ -1,6 +1,18 @@
 import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import { SPHttpClient, SPHttpClientResponse } from '@microsoft/sp-http';
 import { toDateInput, toSharePointDateOnlyPayload } from '../../../shared/sharePointDateUtils';
+import {
+  buildRegistroPagoExpandFields,
+  buildRegistroPagoSelectFields,
+  IRegistroPagoFieldMap,
+  ISharePointListFieldMeta,
+  resolveRegistroPagoFieldMap
+} from '../../../shared/registroPagoFieldMap';
+import {
+  buildRegistroPagoPayload,
+  mapSharePointItemToRegistroPago
+} from '../../../shared/registroPagoPayload';
+import { IRegistroPagoPayload } from '../../../shared/registroPagoTypes';
 
 export interface IViajeData {
   nombre: string;
@@ -21,9 +33,12 @@ export interface IViajeItem extends IViajeData {
 
 export interface IPagoData {
   viajeId: number;
+  /** Título descriptivo opcional del ítem (columna Title). */
+  title?: string;
   concepto: string;
   fechaPago: string;
-  importe: number;
+  /** Importe del movimiento (columna canónica Importe). */
+  monto: number;
   medioPago: string;
   moneda: string;
   tipoPago: string;
@@ -31,6 +46,16 @@ export interface IPagoData {
   cotizacion?: number;
   liquidacionOperadorId?: number;
   servicioAsociadoId?: number;
+  /** Cuenta bancaria (Choice Banco); null limpia el valor. */
+  banco?: string | null;
+  /** Estado del pago (Aprobado / Pendiente). */
+  estado?: string;
+  /** Lookup Pasajero; null limpia el valor. */
+  pasajeroId?: number | null;
+  /** Nombre del pasajero (solo lectura / UI). */
+  pasajeroNombre?: string;
+  /** Motivo de elección (Choice Motivo); null limpia el valor. */
+  motivo?: string | null;
 }
 
 export interface IPagoItem extends IPagoData {
@@ -158,6 +183,8 @@ export default class SharePointViajesService {
   private readonly _context: FormCustomizerContext;
   private readonly _webUrl: string;
   private _fieldMaps: { [listTitle: string]: IStringMap } = {};
+  private _registroPagoFieldMap: IRegistroPagoFieldMap | undefined;
+  private _listaPagosGuid: string | undefined;
 
   public constructor(context: FormCustomizerContext) {
     this._context = context;
@@ -410,82 +437,69 @@ export default class SharePointViajesService {
   public async getPagosByViaje(viajeId: number): Promise<IPagoItem[]> {
     const map = await this._getPagosFieldMap();
     const lookupField = map.ViajeAsociado;
-    const liqLookup = map.LiquidacionOperador;
-    const servicioLookup = map.ServicioViaje;
-
-    const selectFields = [
-      'Id',
-      map.Concepto,
-      map.FechaPago,
-      map.Importe,
-      map.MedioPago,
-      map.Moneda,
-      map.TipoPago,
-      map.Observaciones,
-      map.Cotizacion,
-      lookupField + '/Id',
-      liqLookup + '/Id',
-      liqLookup + '/Title',
-      servicioLookup + '/Id',
-      servicioLookup + '/Title'
-    ];
-    const expandFields = lookupField + ',' + liqLookup + ',' + servicioLookup;
-    const baseUrl = "/_api/web/lists/getByTitle('Registro de Pagos')/items?$select=" +
+    const selectFields = buildRegistroPagoSelectFields(map);
+    const expandFields = buildRegistroPagoExpandFields(map);
+    const baseUrl =
+      "/_api/web/lists/getByTitle('Registro de Pagos')/items?$select=" +
       encodeURIComponent(selectFields.join(',')) +
-      '&$expand=' + encodeURIComponent(expandFields);
+      '&$expand=' +
+      encodeURIComponent(expandFields.join(','));
 
-    const lookupFilterUrl = this._buildUrl(baseUrl + '&$filter=' + encodeURIComponent(lookupField + '/Id eq ' + viajeId));
+    const lookupFilterUrl = this._buildUrl(
+      baseUrl + '&$filter=' + encodeURIComponent(lookupField + '/Id eq ' + viajeId)
+    );
     let json: any;
     try {
       json = await this._get(lookupFilterUrl);
     } catch (error) {
-      const simpleFilterUrl = this._buildUrl(baseUrl + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId));
+      const simpleFilterUrl = this._buildUrl(
+        baseUrl + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId)
+      );
       json = await this._get(simpleFilterUrl);
     }
 
     const values = this._getResults(json);
     return values.map((item: any) => {
-      const liquidacionOperadorId = this._extractLookupId(item, liqLookup);
-      const servicioAsociadoId = this._extractLookupId(item, servicioLookup);
-      const liquidacionOperadorNombre = item[liqLookup] && item[liqLookup].Title
-        ? this._getString(item[liqLookup], 'Title')
-        : '';
-      const tipoPagoLeido = this._getString(item, map.TipoPago);
-      const tipoPago =
-        tipoPagoLeido === 'Egreso' || tipoPagoLeido === 'Ingreso'
-          ? tipoPagoLeido
-          : liquidacionOperadorId > 0
-            ? 'Egreso'
-            : 'Ingreso';
+      const shared = mapSharePointItemToRegistroPago(item, map);
       return {
-        id: item.Id,
-        viajeId: this._extractViajeId(item, lookupField),
-        concepto: this._getString(item, map.Concepto),
-        fechaPago: this._toDateInput(this._getString(item, map.FechaPago)),
-        importe: this._toNumber(item[map.Importe]),
-        medioPago: this._getString(item, map.MedioPago),
-        moneda: this._getString(item, map.Moneda),
-        tipoPago,
-        observaciones: this._getString(item, map.Observaciones),
-        cotizacion: item[map.Cotizacion] !== undefined && item[map.Cotizacion] !== null ? this._toNumber(item[map.Cotizacion]) : undefined,
-        liquidacionOperadorId: liquidacionOperadorId > 0 ? liquidacionOperadorId : undefined,
-        servicioAsociadoId: servicioAsociadoId > 0 ? servicioAsociadoId : undefined,
-        liquidacionOperadorNombre: liquidacionOperadorNombre || undefined
+        id: shared.id,
+        viajeId: shared.viajeAsociadoId && shared.viajeAsociadoId > 0 ? shared.viajeAsociadoId : viajeId,
+        title: shared.title,
+        concepto: shared.concepto,
+        fechaPago: shared.fechaPago,
+        monto: shared.monto,
+        medioPago: shared.medioPago,
+        moneda: shared.moneda,
+        tipoPago: shared.tipoPago,
+        observaciones: shared.observaciones,
+        cotizacion: shared.cotizacion,
+        liquidacionOperadorId: shared.liquidacionOperadorId,
+        servicioAsociadoId: shared.servicioViajeId,
+        liquidacionOperadorNombre: shared.liquidacionOperadorNombre,
+        banco: shared.banco || '',
+        estado: shared.estado || '',
+        pasajeroId: shared.pasajeroId && shared.pasajeroId > 0 ? shared.pasajeroId : undefined,
+        pasajeroNombre: shared.pasajeroNombre || ''
       };
     });
   }
 
   public async createPago(data: IPagoData): Promise<IPagoItem> {
     const map = await this._getPagosFieldMap();
-    const payload = this._buildPagoPayload(map, data);
+    const shared = this._toSharedPagoPayload(data, true);
+    const payload = buildRegistroPagoPayload(shared, map);
+    // TEMP diagnóstico Concepto
+    console.log('[Concepto pago] SharePointViajesService.createPago shared:', shared);
+    console.log('[Concepto pago] SharePointViajesService.createPago payload:', payload);
     const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items");
     const created = await this._post(url, payload);
     return {
       id: created.Id,
       viajeId: data.viajeId,
+      title: data.title,
       concepto: data.concepto,
       fechaPago: data.fechaPago,
-      importe: data.importe,
+      monto: data.monto,
       medioPago: data.medioPago,
       moneda: data.moneda,
       tipoPago: data.tipoPago,
@@ -493,13 +507,22 @@ export default class SharePointViajesService {
       cotizacion: data.cotizacion,
       liquidacionOperadorId: data.liquidacionOperadorId,
       servicioAsociadoId: data.servicioAsociadoId,
-      liquidacionOperadorNombre: undefined
+      liquidacionOperadorNombre: undefined,
+      banco: data.banco || '',
+      estado: data.estado || '',
+      pasajeroId: data.pasajeroId && data.pasajeroId > 0 ? data.pasajeroId : undefined,
+      pasajeroNombre: data.pasajeroNombre || ''
     };
   }
 
   public async updatePago(id: number, data: IPagoData): Promise<void> {
     const map = await this._getPagosFieldMap();
-    const payload = this._buildPagoPayload(map, data);
+    // En edición no se pisa Title: puede haber sido definido por Registro de Pagos.
+    const shared = this._toSharedPagoPayload(data, false);
+    const payload = buildRegistroPagoPayload(shared, map);
+    // TEMP diagnóstico Concepto
+    console.log('[Concepto pago] SharePointViajesService.updatePago shared:', shared);
+    console.log('[Concepto pago] SharePointViajesService.updatePago payload:', payload);
     const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items(" + id + ')');
     await this._post(url, payload, {
       'X-HTTP-Method': 'MERGE',
@@ -513,6 +536,92 @@ export default class SharePointViajesService {
       'X-HTTP-Method': 'DELETE',
       'IF-MATCH': '*'
     });
+  }
+
+  /** Actualiza únicamente Estado = Aprobado (misma regla que Registro de Pagos). */
+  public async approvePago(id: number): Promise<void> {
+    const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Estado) {
+      throw new Error('La columna Estado no existe en la lista Registro de Pagos.');
+    }
+    const payload: { [key: string]: string } = {};
+    payload[map.Estado] = 'Aprobado';
+    const url = this._buildUrl("/_api/web/lists/getByTitle('Registro de Pagos')/items(" + id + ')');
+    await this._post(url, payload, {
+      'X-HTTP-Method': 'MERGE',
+      'IF-MATCH': '*'
+    });
+  }
+
+  /** GUID de la lista Registro de Pagos (cacheado). */
+  public async getListaPagosGuid(): Promise<string> {
+    if (this._listaPagosGuid) {
+      return this._listaPagosGuid;
+    }
+    const url = this._buildUrl(
+      "/_api/web/lists/getByTitle('" + LISTA_PAGOS + "')?$select=Id"
+    );
+    const json: any = await this._get(url);
+    const guid = this._getString(json, 'Id');
+    if (!guid) {
+      throw new Error('No se pudo obtener el Id de la lista Registro de Pagos.');
+    }
+    this._listaPagosGuid = guid;
+    return guid;
+  }
+
+  /**
+   * URL del formulario Display de un ítem de Registro de Pagos
+   * (PageType=4 = Display; no Edit).
+   */
+  public async getPagoDisplayFormUrl(pagoId: number): Promise<string> {
+    if (!pagoId || pagoId <= 0) {
+      throw new Error('El Id del pago es inválido.');
+    }
+    const listGuid = await this.getListaPagosGuid();
+    const webUrl = this._webUrl.replace(/\/$/, '');
+    return (
+      webUrl +
+      '/_layouts/15/listform.aspx?PageType=4&ListId=' +
+      encodeURIComponent(listGuid) +
+      '&ID=' +
+      pagoId
+    );
+  }
+
+  public async getBancoChoices(): Promise<string[]> {
+    const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Banco) {
+      return [];
+    }
+    return this._getChoiceFieldOptions(LISTA_PAGOS, map.Banco || 'Banco');
+  }
+
+  public async getMotivoChoices(): Promise<string[]> {
+    const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Motivo) {
+      return [];
+    }
+    return this._getChoiceFieldOptions(LISTA_PAGOS, map.Motivo || 'Motivo');
+  }
+
+  private async _getChoiceFieldOptions(listTitle: string, fieldInternalName: string): Promise<string[]> {
+    const url = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        listTitle +
+        "')/fields/getByInternalNameOrTitle('" +
+        fieldInternalName +
+        "')?$select=Choices"
+    );
+    const json: any = await this._get(url);
+    const choices = json.Choices;
+    if (Array.isArray(choices)) {
+      return choices.map((choice: string) => String(choice));
+    }
+    if (choices && Array.isArray(choices.results)) {
+      return choices.results.map((choice: string) => String(choice));
+    }
+    return [];
   }
 
   public async getLiquidacionesByViaje(viajeId: number): Promise<ILiquidacionItem[]> {
@@ -1025,20 +1134,65 @@ export default class SharePointViajesService {
     });
   }
 
-  private async _getPagosFieldMap(): Promise<IStringMap> {
-    return this._getFieldMap(LISTA_PAGOS, {
-      ViajeAsociado: 'ViajeAsociado',
-      Concepto: 'Title',
-      FechaPago: 'FechaPago',
-      Importe: 'Importe',
-      MedioPago: 'MedioPago',
-      Moneda: 'Moneda',
-      TipoPago: 'TipoPago',
-      Observaciones: 'Observaciones',
-      Cotizacion: 'Cotizacion',
-      LiquidacionOperador: 'LiquidacionOperador',
-      ServicioViaje: 'ServicioViaje'
-    });
+  private async _getPagosFieldMap(): Promise<IRegistroPagoFieldMap> {
+    if (this._registroPagoFieldMap) {
+      return this._registroPagoFieldMap;
+    }
+
+    const fieldsUrl = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_PAGOS +
+        "')/fields?$select=Title,InternalName,TypeAsString,Hidden"
+    );
+    const json: any = await this._get(fieldsUrl);
+    const fields: ISharePointListFieldMeta[] = this._getResults(json);
+    this._registroPagoFieldMap = resolveRegistroPagoFieldMap(fields);
+    return this._registroPagoFieldMap;
+  }
+
+  private _toSharedPagoPayload(data: IPagoData, includeTitle: boolean): IRegistroPagoPayload {
+    const concepto = (data.concepto || '').trim();
+    const shared: IRegistroPagoPayload = {
+      concepto: concepto || null,
+      monto: data.monto,
+      tipoPago: data.tipoPago,
+      medioPago: data.medioPago,
+      fechaPago: data.fechaPago,
+      moneda: data.moneda,
+      cotizacion:
+        data.cotizacion !== undefined && data.cotizacion !== null && data.cotizacion > 0
+          ? data.cotizacion
+          : null,
+      viajeAsociadoId: data.viajeId > 0 ? data.viajeId : null,
+      observaciones: data.observaciones !== undefined ? data.observaciones || '' : undefined
+    };
+
+    if (includeTitle || data.title !== undefined) {
+      shared.title = (data.title || '').trim() || concepto || 'Registro de Pago';
+    }
+
+    if (data.estado !== undefined) {
+      shared.estado = data.estado;
+    }
+    if (data.banco !== undefined) {
+      shared.banco = data.banco && String(data.banco).trim() ? String(data.banco).trim() : null;
+    }
+    if (data.motivo !== undefined) {
+      shared.motivo = data.motivo && String(data.motivo).trim() ? String(data.motivo).trim() : null;
+    }
+    if (data.pasajeroId !== undefined) {
+      shared.pasajeroId = data.pasajeroId && data.pasajeroId > 0 ? data.pasajeroId : null;
+    }
+
+    if (data.servicioAsociadoId !== undefined) {
+      shared.servicioViajeId = data.servicioAsociadoId > 0 ? data.servicioAsociadoId : null;
+    }
+    if (data.liquidacionOperadorId !== undefined) {
+      shared.liquidacionOperadorId =
+        data.liquidacionOperadorId > 0 ? data.liquidacionOperadorId : null;
+    }
+
+    return shared;
   }
 
   private async _getPasajerosFieldMap(): Promise<IStringMap> {
@@ -1077,10 +1231,6 @@ export default class SharePointViajesService {
         map[key] = 'Title';
         return;
       }
-      if (listTitle === LISTA_PAGOS && key === 'Concepto') {
-        map[key] = 'Title';
-        return;
-      }
       const displayName = displayNameByKey && displayNameByKey[key] ? displayNameByKey[key] : key;
       map[key] = byTitle[displayName] || fallbackByKey[key];
     });
@@ -1105,40 +1255,6 @@ export default class SharePointViajesService {
     payload[map.Pasajeros + 'Id'] = data.pasajerosIds;
     payload[map.Servicios] = data.servicios;
     payload[map.Observaciones] = data.observaciones;
-    return payload;
-  }
-
-  private _buildPagoPayload(map: IStringMap, data: IPagoData): any {
-    const payload: any = {};
-    payload[map.ViajeAsociado + 'Id'] = data.viajeId;
-    payload[map.Concepto] = data.concepto;
-    payload[map.FechaPago] = this._toIsoDateTime(data.fechaPago);
-    payload[map.Importe] = data.importe;
-    payload[map.MedioPago] = data.medioPago;
-    payload[map.Moneda] = data.moneda;
-    payload[map.TipoPago] = data.tipoPago === 'Egreso' ? 'Egreso' : 'Ingreso';
-    payload[map.Observaciones] = data.observaciones || '';
-    if (data.cotizacion !== undefined && data.cotizacion !== null) {
-      payload[map.Cotizacion] = data.cotizacion > 0 ? data.cotizacion : null;
-    } else {
-      payload[map.Cotizacion] = null;
-    }
-    const liqKey = map.LiquidacionOperador + 'Id';
-    if (data.liquidacionOperadorId !== undefined) {
-      if (data.liquidacionOperadorId > 0) {
-        payload[liqKey] = data.liquidacionOperadorId;
-      } else {
-        payload[liqKey] = null;
-      }
-    }
-    const servicioKey = map.ServicioViaje + 'Id';
-    if (data.servicioAsociadoId !== undefined) {
-      if (data.servicioAsociadoId > 0) {
-        payload[servicioKey] = data.servicioAsociadoId;
-      } else {
-        payload[servicioKey] = null;
-      }
-    }
     return payload;
   }
 
@@ -1249,13 +1365,6 @@ export default class SharePointViajesService {
 
   private _toDateInput(value: string): string {
     return toDateInput(value);
-  }
-
-  private _toIsoDateTime(value: string): string {
-    if (!value) {
-      return '';
-    }
-    return value + 'T00:00:00Z';
   }
 
   private _toSharePointDateOnlyPayload(value: string): string {
