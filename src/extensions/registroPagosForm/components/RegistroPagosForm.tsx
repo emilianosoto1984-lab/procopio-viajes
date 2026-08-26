@@ -4,13 +4,18 @@ import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import SharePointPagosService, {
   getEstadoByMedioPago,
   IComprobanteItem,
+  ICuentaBancaria,
+  ILiquidacionOperador,
   IPagoSaldoItem,
   IPasajeroLookupItem,
   IServicioViajeItem,
   IViajeLookupItem
 } from '../services/SharePointPagosService';
 import ReciboPagoService from '../../../shared/ReciboPagoService';
-import { debeGenerarReciboPago } from '../../../shared/reciboPagoUtils';
+import {
+  debeGenerarReciboPago,
+  resolverCuentaBancariaParaRecibo
+} from '../../../shared/reciboPagoUtils';
 import {
   formatDateDisplay,
   getDateOnlyFromSharePoint
@@ -36,14 +41,31 @@ import {
   resolverMotivoViaje
 } from '../../../shared/pagoMedioUtils';
 import {
+  formatMontoMoneda,
   formatSaldoPendienteDisplay,
   getSaldoPendienteServicio,
   montoExcedeSaldoPendiente
 } from '../../../shared/pagoSaldoUtils';
 import {
+  enriquecerLiquidacionConSaldo,
+  formatLiquidacionOperadorLabel,
+  formatSaldoLiquidacionDisplay,
+  montoExcedeSaldoPendienteLiquidacion
+} from '../../../shared/pagoLiquidacionUtils';
+import {
+  calcularDesgloseRecuperoBancario,
+  formatPorcentajeRecuperoDisplay,
+  IDesgloseRecuperoBancario
+} from '../../../shared/pagoRecuperoUtils';
+import {
   buildConceptoPagoConViaje,
   servicioCoincideConConceptoGuardado
 } from '../../../shared/pagoConceptoUtils';
+import {
+  findCuentaBancariaById,
+  getCuentaBancariaLabel,
+  resolverCuentaBancariaHistorica
+} from '../../../shared/cuentasBancariasUtils';
 import styles from './RegistroPagosForm.module.scss';
 
 export interface IRegistroPagosFormProps {
@@ -73,6 +95,7 @@ interface IFieldErrors {
   pasajeroNombre: string;
   pasajeroDni: string;
   concepto: string;
+  liquidacionOperador: string;
   medioPago: string;
   banco: string;
   fechaPago: string;
@@ -101,10 +124,16 @@ interface IRegistroPagosFormState {
   conceptoMoneda: string;
   serviciosViaje: IServicioViajeItem[];
   serviciosViajeCargando: boolean;
+  liquidacionOperadorId: number | null;
+  liquidacionesOperador: ILiquidacionOperador[];
+  liquidacionesOperadorCargando: boolean;
+  egresoHistoricoServicio: boolean;
   pagosViaje: IPagoSaldoItem[];
   medioPago: string;
-  banco: string;
-  opcionesBanco: string[];
+  bancoHistorico: string;
+  cuentasBancarias: ICuentaBancaria[];
+  cuentaBancariaSeleccionada: ICuentaBancaria | undefined;
+  cuentasBancariasError: string;
   motivo: string;
   opcionesMotivo: string[];
   fechaPago: string;
@@ -113,6 +142,14 @@ interface IRegistroPagosFormState {
   moneda: string;
   cotizacion: string;
   estado: string;
+  /**
+   * false = mostrar/guardar desglose histórico persistido.
+   * true = recalcular con la cuenta/monto/medio actuales.
+   */
+  desgloseRecuperoRecalcular: boolean;
+  montoAplicadoViajePersistido: number | null;
+  montoGastosBancariosPersistido: number | null;
+  porcentajeRecuperoPersistido: number | null;
   cargando: boolean;
   guardando: boolean;
   aprobando: boolean;
@@ -323,6 +360,22 @@ const layoutStyles: { [key: string]: React.CSSProperties } = {
     color: '#8a6d00',
     marginTop: 6,
     lineHeight: 1.4
+  },
+  recuperoResumen: {
+    marginTop: 8,
+    padding: '10px 12px',
+    borderRadius: 4,
+    backgroundColor: '#f3f2f1',
+    border: '1px solid #e1dfdd',
+    fontSize: 13,
+    color: '#323130',
+    lineHeight: 1.45
+  },
+  recuperoResumenRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 4
   },
   readOnlyValue: {
     minHeight: 38,
@@ -539,6 +592,7 @@ const emptyFieldErrors = (): IFieldErrors => ({
   pasajeroNombre: '',
   pasajeroDni: '',
   concepto: '',
+  liquidacionOperador: '',
   medioPago: '',
   banco: '',
   fechaPago: '',
@@ -580,10 +634,16 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       conceptoMoneda: '',
       serviciosViaje: [],
       serviciosViajeCargando: false,
+      liquidacionOperadorId: null,
+      liquidacionesOperador: [],
+      liquidacionesOperadorCargando: false,
+      egresoHistoricoServicio: false,
       pagosViaje: [],
       medioPago: '',
-      banco: '',
-      opcionesBanco: [],
+      bancoHistorico: '',
+      cuentasBancarias: [],
+      cuentaBancariaSeleccionada: undefined,
+      cuentasBancariasError: '',
       motivo: '',
       opcionesMotivo: [],
       fechaPago: '',
@@ -592,6 +652,10 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       moneda: '',
       cotizacion: '',
       estado: '',
+      desgloseRecuperoRecalcular: true,
+      montoAplicadoViajePersistido: null,
+      montoGastosBancariosPersistido: null,
+      porcentajeRecuperoPersistido: null,
       cargando: true,
       guardando: false,
       aprobando: false,
@@ -641,6 +705,50 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
 
   private _esAsociadoAViaje(): boolean {
     return this.state.tipoIngreso === 'asociado_viaje';
+  }
+
+  /** Egreso + Sin viaje asociado: concepto libre, sin pasajero/DNI. */
+  private _esEgresoSinViaje(): boolean {
+    return this._normalizarTipoPago(this.state.tipoPago) === 'Egreso' && !this._esAsociadoAViaje();
+  }
+
+  private _esIngresoAsociadoAViaje(): boolean {
+    return this._normalizarTipoPago(this.state.tipoPago) === 'Ingreso' && this._esAsociadoAViaje();
+  }
+
+  private _esEgresoAsociadoAViaje(): boolean {
+    return this._normalizarTipoPago(this.state.tipoPago) === 'Egreso' && this._esAsociadoAViaje();
+  }
+
+  /** Egreso histórico con servicio y sin liquidación (compatibilidad). */
+  private _esEgresoHistoricoServicio(): boolean {
+    return (
+      this.state.egresoHistoricoServicio &&
+      this._esEgresoAsociadoAViaje() &&
+      !this.state.liquidacionOperadorId
+    );
+  }
+
+  private _mostrarPasajeroViaje(): boolean {
+    return this._esIngresoAsociadoAViaje();
+  }
+
+  private _mostrarServicioIngreso(): boolean {
+    return this._esIngresoAsociadoAViaje();
+  }
+
+  private _mostrarLiquidacionEgreso(): boolean {
+    return this._esEgresoAsociadoAViaje() && !this._esEgresoHistoricoServicio();
+  }
+
+  /** Ingreso sin viaje: nombre y DNI manuales. */
+  private _mostrarCamposPasajeroManual(): boolean {
+    return !this._esAsociadoAViaje() && !this._esEgresoSinViaje();
+  }
+
+  /** Concepto de texto libre (solo egreso sin viaje). */
+  private _mostrarConceptoLibre(): boolean {
+    return this._esEgresoSinViaje();
   }
 
   private _getEtiquetaTipoIngreso(tipo: TipoIngresoPago): string {
@@ -700,7 +808,57 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     if (!this._esAsociadoAViaje()) {
       return false;
     }
+    if (this._esEgresoAsociadoAViaje() && !this._esEgresoHistoricoServicio()) {
+      const liquidacion = this._getLiquidacionSeleccionada();
+      if (!liquidacion) {
+        return false;
+      }
+      return requiereCotizacionPago(liquidacion.moneda, this.state.moneda);
+    }
     return requiereCotizacionPago(this.state.conceptoMoneda, this.state.moneda);
+  }
+
+  private _getLiquidacionSeleccionada(): ILiquidacionOperador | undefined {
+    if (!this.state.liquidacionOperadorId) {
+      return undefined;
+    }
+    return this.state.liquidacionesOperador.filter(
+      (item: ILiquidacionOperador) => item.id === this.state.liquidacionOperadorId
+    )[0];
+  }
+
+  private _renderSaldoPendienteLiquidacion(): React.ReactNode {
+    if (!this._mostrarLiquidacionEgreso()) {
+      return null;
+    }
+    const liquidacion = this._getLiquidacionSeleccionada();
+    if (!liquidacion) {
+      return null;
+    }
+    const pagoIdExcluir = this.state.pagoId && this.state.pagoId > 0 ? this.state.pagoId : undefined;
+    const enriquecida = enriquecerLiquidacionConSaldo(
+      liquidacion,
+      this.state.pagosViaje,
+      pagoIdExcluir
+    );
+    const saldoPendiente = enriquecida.saldoPendiente ?? 0;
+    if (saldoPendiente <= 0) {
+      return (
+        <div style={layoutStyles.saldoPendienteWarning}>
+          Esta liquidación no tiene saldo pendiente.
+        </div>
+      );
+    }
+    const cotizacion = this._requiereCotizacion() ? Number(this.state.cotizacion) : undefined;
+    return (
+      <div style={layoutStyles.saldoPendienteInfo}>
+        {formatSaldoLiquidacionDisplay(enriquecida, this.state.moneda, cotizacion)
+          .split('\n')
+          .map((linea: string, index: number) => (
+            <div key={index}>{linea}</div>
+          ))}
+      </div>
+    );
   }
 
   private _getServicioSeleccionado(): IServicioViajeItem | undefined {
@@ -714,7 +872,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
 
   private _getSaldoPendienteServicio(): number | null {
     const servicio = this._getServicioSeleccionado();
-    if (!servicio || !this._esAsociadoAViaje()) {
+    if (!servicio || !this._mostrarServicioIngreso()) {
       return null;
     }
     const pagoIdExcluir = this.state.pagoId && this.state.pagoId > 0 ? this.state.pagoId : undefined;
@@ -767,6 +925,20 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     );
   }
 
+  private _limpiarLiquidacionSeleccionada(): {
+    liquidacionOperadorId: null;
+    liquidacionesOperador: ILiquidacionOperador[];
+    liquidacionesOperadorCargando: boolean;
+    egresoHistoricoServicio: boolean;
+  } {
+    return {
+      liquidacionOperadorId: null,
+      liquidacionesOperador: [],
+      liquidacionesOperadorCargando: false,
+      egresoHistoricoServicio: false
+    };
+  }
+
   private _limpiarConceptoSeleccionado(): {
     servicioAsociadoId: null;
     concepto: string;
@@ -783,6 +955,71 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       serviciosViaje: [],
       serviciosViajeCargando: false
     };
+  }
+
+  private _limpiarAsociacionViaje(): {
+    servicioAsociadoId: null;
+    concepto: string;
+    conceptoMoneda: string;
+    cotizacion: string;
+    serviciosViaje: IServicioViajeItem[];
+    serviciosViajeCargando: boolean;
+    liquidacionOperadorId: null;
+    liquidacionesOperador: ILiquidacionOperador[];
+    liquidacionesOperadorCargando: boolean;
+    egresoHistoricoServicio: boolean;
+  } {
+    return {
+      ...this._limpiarConceptoSeleccionado(),
+      ...this._limpiarLiquidacionSeleccionada()
+    };
+  }
+
+  private async _cargarLiquidacionesViaje(
+    viajeId: number,
+    liquidacionIdPrecargada?: number | null
+  ): Promise<void> {
+    if (!viajeId || viajeId <= 0) {
+      this.setState(this._limpiarLiquidacionSeleccionada());
+      return;
+    }
+
+    const pagoIdExcluir = this.state.pagoId && this.state.pagoId > 0 ? this.state.pagoId : undefined;
+    this.setState({ liquidacionesOperadorCargando: true });
+    try {
+      const liquidaciones = await this._service.getLiquidacionesOperadorDisponibles(
+        viajeId,
+        liquidacionIdPrecargada && liquidacionIdPrecargada > 0 ? liquidacionIdPrecargada : undefined,
+        pagoIdExcluir
+      );
+      let liquidacionOperadorId: number | null = null;
+      let concepto = '';
+      let conceptoMoneda = '';
+
+      if (liquidacionIdPrecargada && liquidacionIdPrecargada > 0) {
+        const liquidacion = liquidaciones.filter(
+          (item: ILiquidacionOperador) => item.id === liquidacionIdPrecargada
+        )[0];
+        if (liquidacion) {
+          liquidacionOperadorId = liquidacion.id;
+          concepto = buildConceptoPagoConViaje(liquidacion.title, this.state.viajeTitulo);
+          conceptoMoneda = normalizarMonedaServicio(liquidacion.moneda);
+        }
+      }
+
+      this.setState({
+        liquidacionesOperador: liquidaciones,
+        liquidacionesOperadorCargando: false,
+        liquidacionOperadorId,
+        concepto,
+        conceptoMoneda
+      });
+    } catch (error) {
+      this.setState({
+        ...this._limpiarLiquidacionSeleccionada(),
+        error: 'No se pudieron cargar las liquidaciones del viaje seleccionado.'
+      });
+    }
   }
 
   private async _cargarServiciosViaje(
@@ -840,6 +1077,112 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
 
   private _requiereCuentaBancaria(): boolean {
     return requiereCuentaBancaria(this.state.medioPago);
+  }
+
+  private _marcarDesgloseRecuperoRecalcular(): { desgloseRecuperoRecalcular: true } {
+    return { desgloseRecuperoRecalcular: true };
+  }
+
+  private _obtenerDesgloseRecuperoActual(): IDesgloseRecuperoBancario {
+    const montoRecibido = Number(this.state.monto);
+    const montoSeguro = isFinite(montoRecibido) && montoRecibido > 0 ? montoRecibido : 0;
+
+    if (this._normalizarTipoPago(this.state.tipoPago) === 'Egreso') {
+      return {
+        aplicaRecupero: false,
+        porcentaje: 0,
+        montoRecibido: montoSeguro,
+        montoAplicadoViaje: montoSeguro,
+        montoGastosBancarios: 0
+      };
+    }
+
+    if (!this.state.desgloseRecuperoRecalcular) {
+      const porcentaje = Number(this.state.porcentajeRecuperoPersistido) || 0;
+      const aplicadoRaw = this.state.montoAplicadoViajePersistido;
+      const gastosRaw = this.state.montoGastosBancariosPersistido;
+      const tieneAplicado =
+        aplicadoRaw !== null && aplicadoRaw !== undefined && isFinite(Number(aplicadoRaw));
+      const tieneGastos =
+        gastosRaw !== null && gastosRaw !== undefined && isFinite(Number(gastosRaw));
+      const aplicado = tieneAplicado ? Number(aplicadoRaw) : montoSeguro;
+      const gastos = tieneGastos ? Number(gastosRaw) : 0;
+      const esTransferencia = (this.state.medioPago || '').trim() === 'Transferencia';
+      const aplica =
+        esTransferencia &&
+        montoSeguro > 0 &&
+        (gastos > 0 || (porcentaje > 0 && tieneAplicado && aplicado < montoSeguro - 0.0001));
+
+      return {
+        aplicaRecupero: aplica,
+        porcentaje: aplica ? porcentaje : 0,
+        montoRecibido: montoSeguro,
+        montoAplicadoViaje: aplica ? aplicado : montoSeguro,
+        montoGastosBancarios: aplica ? (tieneGastos ? gastos : Math.max(0, montoSeguro - aplicado)) : 0
+      };
+    }
+
+    const cuenta = this.state.cuentaBancariaSeleccionada;
+    return calcularDesgloseRecuperoBancario(montoSeguro, {
+      medioPago: this.state.medioPago,
+      aplicaRecupero: cuenta ? cuenta.aplicaRecupero : false,
+      porcentajeRecupero: cuenta ? cuenta.porcentajeRecupero : 0
+    });
+  }
+
+  private _renderCamposDesgloseRecupero(): React.ReactNode {
+    const desglose = this._obtenerDesgloseRecuperoActual();
+    if (!desglose.aplicaRecupero || desglose.montoRecibido <= 0) {
+      return null;
+    }
+    const moneda = this.state.moneda || '';
+    return (
+      <>
+        <div style={layoutStyles.fieldGroup}>
+          <label style={layoutStyles.label}>Monto Aplicado Viaje</label>
+          <div style={layoutStyles.readOnlyValue}>
+            {formatMontoMoneda(desglose.montoAplicadoViaje, moneda)}
+          </div>
+        </div>
+        <div style={layoutStyles.fieldGroup}>
+          <label style={layoutStyles.label}>
+            Recupero Gastos Bancarios ({formatPorcentajeRecuperoDisplay(desglose.porcentaje)}%)
+          </label>
+          <div style={layoutStyles.readOnlyValue}>
+            {formatMontoMoneda(desglose.montoGastosBancarios, moneda)}
+          </div>
+        </div>
+        <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.fieldFullWidth }}>
+          {this._renderResumenRecupero()}
+        </div>
+      </>
+    );
+  }
+
+  private _renderResumenRecupero(): React.ReactNode {
+    const desglose = this._obtenerDesgloseRecuperoActual();
+    if (!desglose.aplicaRecupero || desglose.montoRecibido <= 0) {
+      return null;
+    }
+    const moneda = this.state.moneda || '';
+    return (
+      <div style={layoutStyles.recuperoResumen}>
+        <div style={layoutStyles.recuperoResumenRow}>
+          <span>Importe recibido:</span>
+          <strong>{formatMontoMoneda(desglose.montoRecibido, moneda)}</strong>
+        </div>
+        <div style={layoutStyles.recuperoResumenRow}>
+          <span>Aplicado al viaje:</span>
+          <strong>{formatMontoMoneda(desglose.montoAplicadoViaje, moneda)}</strong>
+        </div>
+        <div style={{ ...layoutStyles.recuperoResumenRow, marginBottom: 0 }}>
+          <span>
+            Recupero gastos bancarios ({formatPorcentajeRecuperoDisplay(desglose.porcentaje)}%):
+          </span>
+          <strong>{formatMontoMoneda(desglose.montoGastosBancarios, moneda)}</strong>
+        </div>
+      </div>
+    );
   }
 
   private _logVisibilidadCuentaBancaria(medioPago: string): void {
@@ -987,17 +1330,132 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     }
   }
 
+  private async _cargarCuentasBancarias(): Promise<{
+    cuentasBancarias: ICuentaBancaria[];
+    cuentasBancariasError: string;
+  }> {
+    console.log('Cargando cuentas bancarias desde CuentasBancarias...');
+    try {
+      const cuentasBancarias = await this._service.getCuentasBancarias();
+      console.log(
+        'Cuentas bancarias cargadas correctamente: ' + cuentasBancarias.length + ' activas'
+      );
+      return { cuentasBancarias, cuentasBancariasError: '' };
+    } catch (error) {
+      console.error('[RegistroPagosForm] No se pudieron cargar las cuentas bancarias.', error);
+      return {
+        cuentasBancarias: [],
+        cuentasBancariasError: 'No se pudieron cargar las cuentas bancarias.'
+      };
+    }
+  }
+
+  private async _resolverCuentaBancariaDesdePago(
+    pago: { cuentaBancariaId?: number | null; banco?: string; medioPago: string },
+    cuentasBancarias: ICuentaBancaria[]
+  ): Promise<{
+    cuentasBancarias: ICuentaBancaria[];
+    cuentaBancariaSeleccionada: ICuentaBancaria | undefined;
+    bancoHistorico: string;
+  }> {
+    const esTransferencia = (pago.medioPago || '').trim() === 'Transferencia';
+    const cuentaBancariaId =
+      pago.cuentaBancariaId && pago.cuentaBancariaId > 0 ? pago.cuentaBancariaId : 0;
+    const bancoHistorico = esTransferencia ? (pago.banco || '').trim() : '';
+
+    if (cuentaBancariaId) {
+      let cuenta = findCuentaBancariaById(cuentasBancarias, cuentaBancariaId);
+      let lista = cuentasBancarias;
+      if (!cuenta) {
+        cuenta = await this._service.getCuentaBancariaById(cuentaBancariaId);
+        if (cuenta) {
+          lista = cuentasBancarias.concat([cuenta]);
+        }
+      }
+      if (cuenta) {
+        return {
+          cuentasBancarias: lista,
+          cuentaBancariaSeleccionada: cuenta,
+          bancoHistorico: ''
+        };
+      }
+      console.warn(
+        '[RegistroPagosForm] Lookup CuentaBancaria Id=' +
+          cuentaBancariaId +
+          ' no se pudo resolver en CuentasBancarias.'
+      );
+    }
+
+    // Fallback temporal: registros históricos que solo tienen Choice Banco.
+    if (bancoHistorico) {
+      const match = resolverCuentaBancariaHistorica(cuentasBancarias, bancoHistorico);
+      if (match.estado === 'unica' && match.cuenta) {
+        console.log(
+          '[RegistroPagosForm] Fallback histórico Banco="' +
+            bancoHistorico +
+            '" → CuentaBancaria Id=' +
+            match.cuenta.id
+        );
+        return {
+          cuentasBancarias,
+          cuentaBancariaSeleccionada: match.cuenta,
+          bancoHistorico: ''
+        };
+      }
+      console.warn(
+        '[RegistroPagosForm] Fallback histórico Banco="' +
+          bancoHistorico +
+          '" sin coincidencia única (' +
+          match.estado +
+          ').'
+      );
+    }
+
+    return {
+      cuentasBancarias,
+      cuentaBancariaSeleccionada: undefined,
+      bancoHistorico
+    };
+  }
+
+  private _getCuentaBancariaSelectValue(): string {
+    if (this.state.cuentaBancariaSeleccionada) {
+      return String(this.state.cuentaBancariaSeleccionada.id);
+    }
+    if ((this.state.bancoHistorico || '').trim()) {
+      return 'legacy';
+    }
+    return '';
+  }
+
+  private _getCuentaBancariaDisplayValue(): string {
+    if (this.state.cuentaBancariaSeleccionada) {
+      return getCuentaBancariaLabel(this.state.cuentaBancariaSeleccionada);
+    }
+    return (this.state.bancoHistorico || '').trim();
+  }
+
+  private _resolverCuentaBancariaIdParaGuardar(): number | null | undefined {
+    const esEdicion = !!(this.state.pagoId && this.state.pagoId > 0);
+    if (this._requiereCuentaBancaria()) {
+      const id = this.state.cuentaBancariaSeleccionada
+        ? this.state.cuentaBancariaSeleccionada.id
+        : 0;
+      return id > 0 ? id : null;
+    }
+    return esEdicion ? null : undefined;
+  }
+
   private async _inicializarFormulario(): Promise<void> {
     try {
       console.log('Aplicando lógica de Fecha de Partida a FechaPago');
-      console.log('Cargando opciones del campo Banco...');
       console.log('Cargando opciones del campo Motivo...');
-      const [opcionesBanco, opcionesMotivo] = await Promise.all([
-        this._service.getBancoChoices(),
-        this._service.getMotivoChoices()
+      const [opcionesMotivo, cuentasResult] = await Promise.all([
+        this._service.getMotivoChoices(),
+        this._cargarCuentasBancarias()
       ]);
-      console.log('Opciones Banco cargadas correctamente');
       console.log('Opciones Motivo cargadas correctamente');
+      const { cuentasBancarias, cuentasBancariasError } = cuentasResult;
 
       const itemId = this._getItemId();
       const esEdicion =
@@ -1010,7 +1468,9 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
             ? this._resolverMotivoViaje(opcionesMotivo)
             : this.state.motivo;
         this.setState({
-          opcionesBanco,
+          cuentasBancarias,
+          cuentaBancariaSeleccionada: undefined,
+          cuentasBancariasError,
           opcionesMotivo,
           motivo,
           cargando: false
@@ -1039,6 +1499,14 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       let concepto = '';
       let conceptoMoneda = '';
       let pagosViaje: IPagoSaldoItem[] = [];
+      let liquidacionOperadorId: number | null = null;
+      let liquidacionesOperador: ILiquidacionOperador[] = [];
+      let egresoHistoricoServicio = false;
+      const tipoPagoNormalizado = this._normalizarTipoPago(pago.tipoPago) || 'Ingreso';
+      const liquidacionIdGuardado =
+        pago.liquidacionOperadorId && pago.liquidacionOperadorId > 0
+          ? pago.liquidacionOperadorId
+          : null;
 
       if (pasajeroId) {
         const pasajero = await this._service.getPasajeroById(pasajeroId);
@@ -1049,44 +1517,76 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         }
       }
 
+      const conceptoGuardado = (pago.concepto || '').trim();
+
       if (tipoIngreso === 'asociado_viaje' && viajeId) {
-        [pasajerosViaje, serviciosViaje, pagosViaje] = await Promise.all([
-          this._service.getPasajerosByViaje(viajeId),
-          this._service.getServiciosViajeByViaje(viajeId),
-          this._service.getPagosSaldoByViaje(viajeId)
-        ]);
-        if (pasajeroId) {
-          const pasajeroViaje = pasajerosViaje.filter((item: IPasajeroLookupItem) => item.id === pasajeroId)[0];
-          if (pasajeroViaje) {
-            pasajeroTitulo = pasajeroViaje.nombreApellido;
+        pagosViaje = await this._service.getPagosSaldoByViaje(viajeId);
+
+        if (tipoPagoNormalizado === 'Ingreso') {
+          [pasajerosViaje, serviciosViaje] = await Promise.all([
+            this._service.getPasajerosByViaje(viajeId),
+            this._service.getServiciosViajeByViaje(viajeId)
+          ]);
+          if (pasajeroId) {
+            const pasajeroViaje = pasajerosViaje.filter(
+              (item: IPasajeroLookupItem) => item.id === pasajeroId
+            )[0];
+            if (pasajeroViaje) {
+              pasajeroTitulo = pasajeroViaje.nombreApellido;
+            }
           }
-        }
-        const conceptoGuardado = (pago.concepto || '').trim();
-        const servicioIdGuardado =
-          pago.servicioAsociadoId && pago.servicioAsociadoId > 0 ? pago.servicioAsociadoId : null;
-        if (servicioIdGuardado) {
-          const servicio = serviciosViaje.filter(
-            (item: IServicioViajeItem) => item.id === servicioIdGuardado
+          const servicioIdGuardado =
+            pago.servicioAsociadoId && pago.servicioAsociadoId > 0 ? pago.servicioAsociadoId : null;
+          if (servicioIdGuardado) {
+            const servicio = serviciosViaje.filter(
+              (item: IServicioViajeItem) => item.id === servicioIdGuardado
+            )[0];
+            if (servicio) {
+              servicioAsociadoId = servicio.id;
+              concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
+              conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
+            } else if (conceptoGuardado) {
+              concepto = conceptoGuardado;
+            }
+          } else if (conceptoGuardado) {
+            const servicio = serviciosViaje.filter((item: IServicioViajeItem) =>
+              servicioCoincideConConceptoGuardado(item.concepto, conceptoGuardado, viajeTitulo)
+            )[0];
+            if (servicio) {
+              servicioAsociadoId = servicio.id;
+              concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
+              conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
+            } else {
+              concepto = conceptoGuardado;
+            }
+          }
+        } else if (liquidacionIdGuardado) {
+          liquidacionOperadorId = liquidacionIdGuardado;
+          liquidacionesOperador = await this._service.getLiquidacionesOperadorDisponibles(
+            viajeId,
+            liquidacionIdGuardado,
+            pago.id
+          );
+          const liquidacion = liquidacionesOperador.filter(
+            (item: ILiquidacionOperador) => item.id === liquidacionIdGuardado
           )[0];
-          if (servicio) {
-            servicioAsociadoId = servicio.id;
-            concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
-            conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
+          if (liquidacion) {
+            concepto = buildConceptoPagoConViaje(liquidacion.title, viajeTitulo);
+            conceptoMoneda = normalizarMonedaServicio(liquidacion.moneda);
           } else if (conceptoGuardado) {
             concepto = conceptoGuardado;
           }
-        } else if (conceptoGuardado) {
-          const servicio = serviciosViaje.filter((item: IServicioViajeItem) =>
-            servicioCoincideConConceptoGuardado(item.concepto, conceptoGuardado, viajeTitulo)
-          )[0];
-          if (servicio) {
-            servicioAsociadoId = servicio.id;
-            concepto = buildConceptoPagoConViaje(servicio.concepto, viajeTitulo);
-            conceptoMoneda = normalizarMonedaServicio(servicio.moneda);
-          } else {
-            concepto = conceptoGuardado;
+        } else {
+          egresoHistoricoServicio =
+            !!(pago.servicioAsociadoId && pago.servicioAsociadoId > 0) || !!conceptoGuardado;
+          if (pago.servicioAsociadoId && pago.servicioAsociadoId > 0) {
+            servicioAsociadoId = pago.servicioAsociadoId;
           }
+          concepto = conceptoGuardado;
         }
+      } else if (tipoIngreso === 'sin_viaje') {
+        // Egreso sin viaje (y compatibilidad de lectura): Concepto libre en columna SharePoint.
+        concepto = conceptoGuardado;
       }
 
       const fechaPago = getDateOnlyFromSharePoint(pago.fechaPago);
@@ -1103,6 +1603,8 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         tipoIngreso === 'asociado_viaje'
           ? this._resolverMotivoViaje(opcionesMotivo) || pago.motivo || ''
           : pago.motivo || '';
+
+      const cuentaResolucion = await this._resolverCuentaBancariaDesdePago(pago, cuentasBancarias);
 
       this.setState({
         pagoId: pago.id,
@@ -1122,11 +1624,17 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         conceptoMoneda,
         serviciosViaje,
         serviciosViajeCargando: false,
+        liquidacionOperadorId,
+        liquidacionesOperador,
+        liquidacionesOperadorCargando: false,
+        egresoHistoricoServicio,
         pagosViaje,
         medioPago: pago.medioPago,
-        banco: pago.medioPago === 'Transferencia' ? (pago.banco || '') : '',
+        bancoHistorico: cuentaResolucion.bancoHistorico,
+        cuentasBancarias: cuentaResolucion.cuentasBancarias,
+        cuentaBancariaSeleccionada: cuentaResolucion.cuentaBancariaSeleccionada,
+        cuentasBancariasError,
         motivo: motivo,
-        opcionesBanco,
         opcionesMotivo,
         fechaPago,
         fechaPagoTexto: fechaTextoDesdeValor(fechaPago),
@@ -1134,6 +1642,19 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         moneda,
         cotizacion: pago.cotizacion !== undefined && pago.cotizacion > 0 ? String(pago.cotizacion) : '',
         estado: pago.estado,
+        desgloseRecuperoRecalcular: false,
+        montoAplicadoViajePersistido:
+          pago.montoAplicadoViaje !== undefined && pago.montoAplicadoViaje !== null
+            ? pago.montoAplicadoViaje
+            : null,
+        montoGastosBancariosPersistido:
+          pago.montoGastosBancarios !== undefined && pago.montoGastosBancarios !== null
+            ? pago.montoGastosBancarios
+            : null,
+        porcentajeRecuperoPersistido:
+          pago.porcentajeRecupero !== undefined && pago.porcentajeRecupero !== null
+            ? pago.porcentajeRecupero
+            : null,
         comprobantes,
         cargando: false,
         error: '',
@@ -1152,9 +1673,76 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     if (this._esSoloLectura() || this.state.tipoPago === tipoPago) {
       return;
     }
+
+    // Al pasar a Egreso + Sin viaje: ocultar pasajero/DNI y limpiar esos datos.
+    if (tipoPago === 'Egreso' && this.state.tipoIngreso === 'sin_viaje') {
+      this.setState({
+        tipoPago,
+        pasajeroId: null,
+        pasajeroTitulo: '',
+        pasajeroNombre: '',
+        pasajeroDni: '',
+        ...this._limpiarAsociacionViaje(),
+        fieldErrors: {
+          ...this.state.fieldErrors,
+          tipoPago: '',
+          pasajeroNombre: '',
+          pasajeroDni: '',
+          concepto: '',
+          liquidacionOperador: ''
+        }
+      });
+      return;
+    }
+
+    // Al volver a Ingreso + Sin viaje: el concepto libre deja de aplicarse.
+    if (
+      this.state.tipoPago === 'Egreso' &&
+      tipoPago === 'Ingreso' &&
+      this.state.tipoIngreso === 'sin_viaje'
+    ) {
+      this.setState({
+        tipoPago,
+        ...this._limpiarAsociacionViaje(),
+        fieldErrors: {
+          ...this.state.fieldErrors,
+          tipoPago: '',
+          concepto: '',
+          pasajeroNombre: '',
+          pasajeroDni: '',
+          liquidacionOperador: ''
+        }
+      });
+      return;
+    }
+
     this.setState({
       tipoPago,
-      fieldErrors: { ...this.state.fieldErrors, tipoPago: '' }
+      pasajeroId: null,
+      pasajeroTitulo: '',
+      pasajeroNombre: '',
+      pasajeroDni: '',
+      ...this._limpiarAsociacionViaje(),
+      fieldErrors: {
+        ...this.state.fieldErrors,
+        tipoPago: '',
+        pasajero: '',
+        pasajeroNombre: '',
+        pasajeroDni: '',
+        concepto: '',
+        liquidacionOperador: ''
+      }
+    }, () => {
+      if (tipoPago === 'Egreso' && this.state.tipoIngreso === 'asociado_viaje' && this.state.viajeId) {
+        void this._cargarLiquidacionesViaje(this.state.viajeId);
+      } else if (
+        tipoPago === 'Ingreso' &&
+        this.state.tipoIngreso === 'asociado_viaje' &&
+        this.state.viajeId
+      ) {
+        void this._cargarServiciosViaje(this.state.viajeId);
+        void this._cargarPasajerosViaje(this.state.viajeId);
+      }
     });
   };
 
@@ -1178,12 +1766,13 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         pasajeroDni: '',
         motivo: '',
         pagosViaje: [],
-        ...this._limpiarConceptoSeleccionado(),
+        ...this._limpiarAsociacionViaje(),
         fieldErrors: {
           ...this.state.fieldErrors,
           viaje: '',
           pasajero: '',
-          concepto: ''
+          concepto: '',
+          liquidacionOperador: ''
         }
       });
       return;
@@ -1197,12 +1786,13 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       pasajeroId: null,
       pasajeroTitulo: '',
       pasajerosViaje: [],
-      ...this._limpiarConceptoSeleccionado(),
+      ...this._limpiarAsociacionViaje(),
       fieldErrors: {
         ...this.state.fieldErrors,
         pasajeroNombre: '',
         pasajeroDni: '',
-        concepto: ''
+        concepto: '',
+        liquidacionOperador: ''
       }
     });
   };
@@ -1221,8 +1811,14 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       pasajeroTitulo: '',
       pasajerosViaje: [],
       pagosViaje: [],
-      ...this._limpiarConceptoSeleccionado(),
-      fieldErrors: { ...this.state.fieldErrors, viaje: '', pasajero: '', concepto: '' }
+      ...this._limpiarAsociacionViaje(),
+      fieldErrors: {
+        ...this.state.fieldErrors,
+        viaje: '',
+        pasajero: '',
+        concepto: '',
+        liquidacionOperador: ''
+      }
     });
 
     if (this._viajeSearchTimer) {
@@ -1257,12 +1853,47 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       viajesResultados: [],
       pasajeroId: null,
       pasajeroTitulo: '',
-      ...this._limpiarConceptoSeleccionado(),
-      fieldErrors: { ...this.state.fieldErrors, viaje: '', pasajero: '', concepto: '' }
+      ...this._limpiarAsociacionViaje(),
+      fieldErrors: {
+        ...this.state.fieldErrors,
+        viaje: '',
+        pasajero: '',
+        concepto: '',
+        liquidacionOperador: ''
+      }
     });
-    void this._cargarPasajerosViaje(viaje.id);
-    void this._cargarServiciosViaje(viaje.id);
+    if (this._esIngresoAsociadoAViaje()) {
+      void this._cargarPasajerosViaje(viaje.id);
+      void this._cargarServiciosViaje(viaje.id);
+    } else if (this._esEgresoAsociadoAViaje()) {
+      void this._cargarLiquidacionesViaje(viaje.id);
+    }
     void this._cargarPagosViaje(viaje.id);
+  };
+
+  private _onCambiarLiquidacionOperador = (event: React.ChangeEvent<HTMLSelectElement>): void => {
+    const liquidacionId = Number(event.target.value) || null;
+    const liquidacion = this.state.liquidacionesOperador.filter(
+      (item: ILiquidacionOperador) => item.id === liquidacionId
+    )[0];
+    const conceptoMoneda = liquidacion ? normalizarMonedaServicio(liquidacion.moneda) : '';
+    const requiereCotizacion = liquidacion
+      ? requiereCotizacionPago(conceptoMoneda, this.state.moneda)
+      : false;
+    this.setState({
+      liquidacionOperadorId: liquidacionId,
+      concepto: liquidacion
+        ? buildConceptoPagoConViaje(liquidacion.title, this.state.viajeTitulo)
+        : '',
+      conceptoMoneda,
+      cotizacion: requiereCotizacion ? this.state.cotizacion : '',
+      fieldErrors: {
+        ...this.state.fieldErrors,
+        liquidacionOperador: '',
+        cotizacion: requiereCotizacion ? this.state.fieldErrors.cotizacion : '',
+        monto: ''
+      }
+    });
   };
 
   private _onCambiarServicioConcepto = (event: React.ChangeEvent<HTMLSelectElement>): void => {
@@ -1289,11 +1920,28 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
   };
 
   private _resolverConceptoAsociadoAViajeParaGuardar(): string {
+    if (this._esEgresoAsociadoAViaje() && !this._esEgresoHistoricoServicio()) {
+      const liquidacion = this._getLiquidacionSeleccionada();
+      if (liquidacion) {
+        return buildConceptoPagoConViaje(liquidacion.title, this.state.viajeTitulo);
+      }
+    }
     const servicio = this._getServicioSeleccionado();
     if (servicio) {
       return buildConceptoPagoConViaje(servicio.concepto, this.state.viajeTitulo);
     }
     return (this.state.concepto || '').trim();
+  }
+
+  /** Concepto a persistir: viaje (servicio), egreso sin viaje (texto libre), o sin cambio. */
+  private _resolverConceptoParaGuardar(): string | undefined {
+    if (this._esAsociadoAViaje()) {
+      return this._resolverConceptoAsociadoAViajeParaGuardar();
+    }
+    if (this._esEgresoSinViaje()) {
+      return (this.state.concepto || '').trim();
+    }
+    return undefined;
   }
 
   private _onCambiarPasajeroViaje = (event: React.ChangeEvent<HTMLSelectElement>): void => {
@@ -1320,23 +1968,64 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     });
   };
 
+  private _onCambiarConceptoLibre = (event: React.ChangeEvent<HTMLInputElement>): void => {
+    this.setState({
+      concepto: event.target.value,
+      fieldErrors: { ...this.state.fieldErrors, concepto: '' }
+    });
+  };
+
   private _onCambiarMedioPago = (event: React.ChangeEvent<HTMLSelectElement>): void => {
     const medioPago = event.target.value;
     this._logVisibilidadCuentaBancaria(medioPago);
+    const esTransferencia = medioPago === 'Transferencia';
     this.setState({
       medioPago,
-      banco: medioPago === 'Transferencia' ? this.state.banco : '',
+      bancoHistorico: esTransferencia ? this.state.bancoHistorico : '',
+      cuentaBancariaSeleccionada: esTransferencia
+        ? this.state.cuentaBancariaSeleccionada
+        : undefined,
+      ...this._marcarDesgloseRecuperoRecalcular(),
       fieldErrors: {
         ...this.state.fieldErrors,
         medioPago: '',
-        banco: medioPago === 'Transferencia' ? this.state.fieldErrors.banco : ''
+        banco: esTransferencia ? this.state.fieldErrors.banco : ''
       }
     });
   };
 
   private _onCambiarBanco = (event: React.ChangeEvent<HTMLSelectElement>): void => {
+    const raw = event.target.value;
+    if (!raw) {
+      this.setState({
+        bancoHistorico: '',
+        cuentaBancariaSeleccionada: undefined,
+        ...this._marcarDesgloseRecuperoRecalcular(),
+        fieldErrors: { ...this.state.fieldErrors, banco: '' }
+      });
+      return;
+    }
+    if (raw === 'legacy') {
+      this.setState({
+        fieldErrors: { ...this.state.fieldErrors, banco: '' }
+      });
+      return;
+    }
+    const cuentaId = Number(raw) || 0;
+    const cuenta = findCuentaBancariaById(this.state.cuentasBancarias, cuentaId);
+    if (!cuenta) {
+      this.setState({
+        bancoHistorico: '',
+        cuentaBancariaSeleccionada: undefined,
+        ...this._marcarDesgloseRecuperoRecalcular(),
+        fieldErrors: { ...this.state.fieldErrors, banco: '' }
+      });
+      return;
+    }
     this.setState({
-      banco: event.target.value,
+      cuentaBancariaSeleccionada: cuenta,
+      bancoHistorico: '',
+      ...this._marcarDesgloseRecuperoRecalcular(),
       fieldErrors: { ...this.state.fieldErrors, banco: '' }
     });
   };
@@ -1492,6 +2181,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
   private _onCambiarMonto = (event: React.ChangeEvent<HTMLInputElement>): void => {
     this.setState({
       monto: event.target.value,
+      ...this._marcarDesgloseRecuperoRecalcular(),
       fieldErrors: { ...this.state.fieldErrors, monto: '' }
     });
   };
@@ -1503,6 +2193,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     this.setState({
       moneda,
       cotizacion: requiereCotizacion ? this.state.cotizacion : '',
+      ...this._marcarDesgloseRecuperoRecalcular(),
       fieldErrors: {
         ...this.state.fieldErrors,
         moneda: '',
@@ -1714,6 +2405,11 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     monto: number;
     moneda: string;
     formaPago: string;
+    cuentaBancaria: string;
+    montoAplicadoViaje: number | null;
+    montoGastosBancarios: number | null;
+    porcentajeRecupero: number | null;
+    cotizacion: number | null;
   } {
     let nombreApellido = '';
     let dni = '';
@@ -1730,6 +2426,13 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       dni = this.state.pasajeroDni;
     }
 
+    const desglose = this._obtenerDesgloseRecuperoActual();
+    const cuentaBancaria = resolverCuentaBancariaParaRecibo({
+      medioPago: this.state.medioPago,
+      cuentaLabel: this._getCuentaBancariaDisplayValue(),
+      bancoHistorico: this.state.bancoHistorico
+    });
+
     return {
       nombreApellido,
       dni,
@@ -1739,7 +2442,15 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       fechaPago: this.state.fechaPago,
       monto: Number(this.state.monto),
       moneda: this.state.moneda,
-      formaPago: this.state.medioPago
+      formaPago: this.state.medioPago,
+      cuentaBancaria,
+      // Valores del desglose actual del formulario (persistidos o a persistir); el PDF no recalcula.
+      montoAplicadoViaje: desglose.aplicaRecupero ? desglose.montoAplicadoViaje : null,
+      montoGastosBancarios: desglose.aplicaRecupero ? desglose.montoGastosBancarios : 0,
+      porcentajeRecupero: desglose.aplicaRecupero ? desglose.porcentaje : null,
+      cotizacion: this._requiereCotizacion()
+        ? Number(this.state.cotizacion) || null
+        : null
     };
   }
 
@@ -1757,7 +2468,12 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         concepto: datos.concepto,
         monto: datos.monto,
         moneda: datos.moneda,
-        formaPago: datos.formaPago
+        formaPago: datos.formaPago,
+        cuentaBancaria: datos.cuentaBancaria,
+        montoAplicadoViaje: datos.montoAplicadoViaje,
+        montoGastosBancarios: datos.montoGastosBancarios,
+        porcentajeRecupero: datos.porcentajeRecupero,
+        cotizacion: datos.cotizacion
       };
       const resultado = opciones && opciones.regenerar
         ? await this._reciboService.regenerarRecibo(payload)
@@ -1805,7 +2521,12 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         concepto: datos.concepto,
         monto: datos.monto,
         moneda: datos.moneda,
-        formaPago: datos.formaPago
+        formaPago: datos.formaPago,
+        cuentaBancaria: datos.cuentaBancaria,
+        montoAplicadoViaje: datos.montoAplicadoViaje,
+        montoGastosBancarios: datos.montoGastosBancarios,
+        porcentajeRecupero: datos.porcentajeRecupero,
+        cotizacion: datos.cotizacion
       });
 
       await this._refrescarComprobantes(itemId);
@@ -1864,11 +2585,23 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         fieldErrors.viaje = 'El viaje es obligatorio.';
         valido = false;
       }
-      if (!this.state.pasajeroId || this.state.pasajeroId <= 0) {
-        fieldErrors.pasajero = 'El pasajero es obligatorio.';
-        valido = false;
+      if (this._esIngresoAsociadoAViaje()) {
+        if (!this.state.pasajeroId || this.state.pasajeroId <= 0) {
+          fieldErrors.pasajero = 'El pasajero es obligatorio.';
+          valido = false;
+        }
+        if (!this.state.servicioAsociadoId || !(this.state.concepto || '').trim()) {
+          fieldErrors.concepto = 'El concepto es obligatorio.';
+          valido = false;
+        }
+      } else if (this._mostrarLiquidacionEgreso()) {
+        if (!this.state.liquidacionOperadorId || this.state.liquidacionOperadorId <= 0) {
+          fieldErrors.liquidacionOperador = 'Debe seleccionar una liquidación de operador.';
+          valido = false;
+        }
       }
-      if (!this.state.servicioAsociadoId || !(this.state.concepto || '').trim()) {
+    } else if (this._esEgresoSinViaje()) {
+      if (!(this.state.concepto || '').trim()) {
         fieldErrors.concepto = 'El concepto es obligatorio.';
         valido = false;
       }
@@ -1889,7 +2622,21 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
     }
 
     if (this._requiereCuentaBancaria()) {
-      if (!(this.state.banco || '').trim()) {
+      const cuentaId = this.state.cuentaBancariaSeleccionada
+        ? this.state.cuentaBancariaSeleccionada.id
+        : 0;
+      if (this.state.cuentasBancariasError && !(cuentaId > 0)) {
+        fieldErrors.banco =
+          'No se pudieron cargar las cuentas bancarias. Reintentá o contactá al administrador.';
+        valido = false;
+      } else if (
+        !this.state.cuentasBancariasError &&
+        this.state.cuentasBancarias.length === 0 &&
+        !(cuentaId > 0)
+      ) {
+        fieldErrors.banco = 'No hay cuentas bancarias activas configuradas.';
+        valido = false;
+      } else if (!(cuentaId > 0)) {
         fieldErrors.banco = 'La cuenta bancaria es obligatoria cuando el medio de pago es Transferencia.';
         valido = false;
       }
@@ -1918,9 +2665,38 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       const cotizacionValidacion = this._requiereCotizacion()
         ? Number(this.state.cotizacion)
         : undefined;
+      const desglose = this._obtenerDesgloseRecuperoActual();
+      const montoParaSaldo = desglose.aplicaRecupero
+        ? desglose.montoAplicadoViaje
+        : montoNumerico;
       if (
         montoExcedeSaldoPendiente(
           servicio,
+          this.state.pagosViaje,
+          montoParaSaldo,
+          this.state.moneda,
+          cotizacionValidacion,
+          pagoIdExcluir
+        )
+      ) {
+        fieldErrors.monto = desglose.aplicaRecupero
+          ? 'El importe aplicado al viaje supera el saldo pendiente del servicio.'
+          : 'El monto ingresado supera el saldo pendiente del servicio.';
+        valido = false;
+      }
+    } else if (
+      this._mostrarLiquidacionEgreso() &&
+      this._getLiquidacionSeleccionada()
+    ) {
+      const liquidacion = this._getLiquidacionSeleccionada() as ILiquidacionOperador;
+      const pagoIdExcluir =
+        this.state.pagoId && this.state.pagoId > 0 ? this.state.pagoId : undefined;
+      const cotizacionValidacion = this._requiereCotizacion()
+        ? Number(this.state.cotizacion)
+        : undefined;
+      if (
+        montoExcedeSaldoPendienteLiquidacion(
+          liquidacion,
           this.state.pagosViaje,
           montoNumerico,
           this.state.moneda,
@@ -1928,7 +2704,8 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
           pagoIdExcluir
         )
       ) {
-        fieldErrors.monto = 'El monto ingresado supera el saldo pendiente del servicio.';
+        fieldErrors.monto =
+          'El importe del egreso no puede superar el saldo pendiente de la liquidación.';
         valido = false;
       }
     }
@@ -1963,6 +2740,25 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       return servicioId && servicioId > 0 ? servicioId : esEdicion ? 0 : undefined;
     }
 
+    if (this._esEgresoHistoricoServicio()) {
+      const servicioId = this.state.servicioAsociadoId;
+      return servicioId && servicioId > 0 ? servicioId : esEdicion ? 0 : undefined;
+    }
+
+    return esEdicion ? 0 : undefined;
+  }
+
+  private _resolverLiquidacionOperadorIdParaGuardar(): number | undefined {
+    const esEdicion = !!(this.state.pagoId && this.state.pagoId > 0);
+
+    if (this._esEgresoAsociadoAViaje()) {
+      if (this._esEgresoHistoricoServicio()) {
+        return esEdicion ? undefined : undefined;
+      }
+      const liquidacionId = this.state.liquidacionOperadorId;
+      return liquidacionId && liquidacionId > 0 ? liquidacionId : esEdicion ? 0 : undefined;
+    }
+
     return esEdicion ? 0 : undefined;
   }
 
@@ -1982,18 +2778,37 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
       const estado = getEstadoByMedioPago(this.state.medioPago);
       this._logEstadoPorMedioPago(this.state.medioPago);
 
-      const banco = this._requiereCuentaBancaria() ? this.state.banco : '';
-      console.log('Guardando Banco: ' + (banco || '(vacío)'));
+      const cuentaBancariaId = this._resolverCuentaBancariaIdParaGuardar();
+      console.log(
+        'Guardando CuentaBancariaId: ' +
+          (cuentaBancariaId !== undefined && cuentaBancariaId !== null
+            ? String(cuentaBancariaId)
+            : '(sin lookup)')
+      );
+
+      const desglose = this._obtenerDesgloseRecuperoActual();
+      console.log(
+        '[Recupero bancario] aplica=' +
+          desglose.aplicaRecupero +
+          ' recibido=' +
+          desglose.montoRecibido +
+          ' aplicadoViaje=' +
+          desglose.montoAplicadoViaje +
+          ' gastos=' +
+          desglose.montoGastosBancarios +
+          ' %=' +
+          desglose.porcentaje
+      );
 
       let pasajeroId = 0;
       let pasajeroNombre = '';
-      if (this._esAsociadoAViaje()) {
+      if (this._esIngresoAsociadoAViaje()) {
         pasajeroId = this.state.pasajeroId as number;
         const pasajero = this.state.pasajerosViaje.filter(
           (item: IPasajeroLookupItem) => item.id === pasajeroId
         )[0];
         pasajeroNombre = pasajero ? pasajero.nombreApellido : this.state.pasajeroTitulo;
-      } else {
+      } else if (this._mostrarCamposPasajeroManual()) {
         const pasajero = await this._service.findOrCreatePasajero(
           this.state.pasajeroNombre,
           this.state.pasajeroDni
@@ -2002,19 +2817,19 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         pasajeroNombre = pasajero.nombreApellido;
         console.log('Pasajero resuelto para pago sin viaje: ' + pasajeroId);
       }
+      // Egreso sin viaje: no se crea ni asocia pasajero.
 
-      const conceptoParaGuardar = this._esAsociadoAViaje()
-        ? this._resolverConceptoAsociadoAViajeParaGuardar()
-        : undefined;
+      const conceptoParaGuardar = this._resolverConceptoParaGuardar();
       // TEMP diagnóstico Concepto — quitar cuando se confirme la causa
-      if (this._esAsociadoAViaje()) {
-        const servicioDiag = this._getServicioSeleccionado();
+      if (conceptoParaGuardar !== undefined) {
+        const servicioDiag = this._esAsociadoAViaje() ? this._getServicioSeleccionado() : undefined;
         console.log('[Concepto pago] origen=RegistroPagosForm');
         console.log(
           '[Concepto pago] servicio:',
           servicioDiag ? servicioDiag.concepto : '(sin servicio)'
         );
         console.log('[Concepto pago] viaje:', this.state.viajeTitulo);
+        console.log('[Concepto pago] egresoSinViaje:', this._esEgresoSinViaje());
         console.log('[Concepto pago] concepto generado:', conceptoParaGuardar);
         console.log('[Concepto pago] state.concepto:', this.state.concepto);
       }
@@ -2031,10 +2846,14 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
         monto: Number(this.state.monto),
         moneda: this.state.moneda,
         estado,
-        banco,
+        cuentaBancariaId,
+        montoAplicadoViaje: desglose.montoAplicadoViaje,
+        montoGastosBancarios: desglose.montoGastosBancarios,
+        porcentajeRecupero: desglose.porcentaje,
         motivo: this.state.motivo,
         cotizacion: this._requiereCotizacion() ? Number(this.state.cotizacion) || 0 : undefined,
-        servicioAsociadoId: this._resolverServicioAsociadoIdParaGuardar()
+        servicioAsociadoId: this._resolverServicioAsociadoIdParaGuardar(),
+        liquidacionOperadorId: this._resolverLiquidacionOperadorIdParaGuardar()
       };
 
       const esCreacion = !this.state.pagoId;
@@ -2557,7 +3376,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 </div>
               )}
 
-              {this._esAsociadoAViaje() && (
+              {this._mostrarPasajeroViaje() && (
                 <div style={layoutStyles.fieldGroup}>
                   <label style={layoutStyles.label}>Pasajero</label>
                   {soloLectura ? (
@@ -2604,7 +3423,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 </div>
               )}
 
-              {this._esAsociadoAViaje() && (
+              {this._mostrarServicioIngreso() && (
                 <div style={layoutStyles.fieldGroup}>
                   <label style={layoutStyles.label}>Servicio a abonar</label>
                   {soloLectura ? (
@@ -2660,7 +3479,81 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 </div>
               )}
 
-              {!this._esAsociadoAViaje() && (
+              {this._esEgresoHistoricoServicio() && (
+                <div style={layoutStyles.fieldGroup}>
+                  <label style={layoutStyles.label}>Concepto (registro histórico)</label>
+                  <div style={layoutStyles.readOnlyValue}>{this.state.concepto || '—'}</div>
+                  <div style={{ fontSize: 12, color: '#ca5010', marginTop: 4 }}>
+                    Este egreso fue registrado con la lógica anterior (servicio). Para nuevos egresos
+                    asociados a viaje, seleccione una liquidación de operador.
+                  </div>
+                </div>
+              )}
+
+              {this._mostrarLiquidacionEgreso() && (
+                <div style={layoutStyles.fieldGroup}>
+                  <label style={layoutStyles.label}>Liquidación de Operador</label>
+                  {soloLectura ? (
+                    <>
+                      <div style={layoutStyles.readOnlyValue}>
+                        {this._getLiquidacionSeleccionada()
+                          ? formatLiquidacionOperadorLabel(
+                              this._getLiquidacionSeleccionada() as ILiquidacionOperador
+                            )
+                          : '—'}
+                      </div>
+                      {this._renderSaldoPendienteLiquidacion()}
+                    </>
+                  ) : (
+                    <>
+                      <select
+                        style={{
+                          ...layoutStyles.select,
+                          ...(this.state.fieldErrors.liquidacionOperador
+                            ? layoutStyles.fieldInputError
+                            : {})
+                        }}
+                        value={this.state.liquidacionOperadorId || ''}
+                        onChange={this._onCambiarLiquidacionOperador}
+                        disabled={
+                          this.state.guardando ||
+                          !this.state.viajeId ||
+                          this.state.liquidacionesOperadorCargando
+                        }
+                      >
+                        <option value="">
+                          {this.state.liquidacionesOperadorCargando
+                            ? 'Cargando liquidaciones...'
+                            : this.state.viajeId
+                              ? 'Seleccione...'
+                              : 'Seleccione un viaje primero'}
+                        </option>
+                        {this.state.liquidacionesOperador.map((liquidacion: ILiquidacionOperador) => (
+                          <option key={liquidacion.id} value={liquidacion.id}>
+                            {formatLiquidacionOperadorLabel(liquidacion)}
+                          </option>
+                        ))}
+                      </select>
+                      {this.state.liquidacionesOperadorCargando && (
+                        <div style={{ fontSize: 12, color: '#605e5c', marginTop: 4 }}>
+                          Cargando liquidaciones del viaje...
+                        </div>
+                      )}
+                      {this.state.viajeId &&
+                        !this.state.liquidacionesOperadorCargando &&
+                        this.state.liquidacionesOperador.length === 0 && (
+                          <div style={{ fontSize: 12, color: '#605e5c', marginTop: 4 }}>
+                            No hay liquidaciones de operadores disponibles para este viaje.
+                          </div>
+                        )}
+                      {this._renderSaldoPendienteLiquidacion()}
+                    </>
+                  )}
+                  {this._renderFieldError(this.state.fieldErrors.liquidacionOperador)}
+                </div>
+              )}
+
+              {this._mostrarCamposPasajeroManual() && (
                 <div style={layoutStyles.fieldGroup}>
                   <label style={layoutStyles.label}>{soloLectura ? 'Pasajero' : 'Nombre'}</label>
                   {soloLectura ? (
@@ -2682,7 +3575,7 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 </div>
               )}
 
-              {!this._esAsociadoAViaje() && (
+              {this._mostrarCamposPasajeroManual() && (
                 <div style={layoutStyles.fieldGroup}>
                   <label style={layoutStyles.label}>DNI</label>
                   {soloLectura ? (
@@ -2701,6 +3594,28 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                     />
                   )}
                   {this._renderFieldError(this.state.fieldErrors.pasajeroDni)}
+                </div>
+              )}
+
+              {this._mostrarConceptoLibre() && (
+                <div style={layoutStyles.fieldGroup}>
+                  <label style={layoutStyles.label}>Concepto</label>
+                  {soloLectura ? (
+                    <div style={layoutStyles.readOnlyValue}>{this.state.concepto || '—'}</div>
+                  ) : (
+                    <input
+                      type="text"
+                      style={{
+                        ...layoutStyles.fieldInput,
+                        ...(this.state.fieldErrors.concepto ? layoutStyles.fieldInputError : {})
+                      }}
+                      value={this.state.concepto}
+                      onChange={this._onCambiarConceptoLibre}
+                      placeholder="Concepto del egreso"
+                      disabled={this.state.guardando}
+                    />
+                  )}
+                  {this._renderFieldError(this.state.fieldErrors.concepto)}
                 </div>
               )}
 
@@ -2733,25 +3648,43 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 <div style={layoutStyles.fieldGroup}>
                   <label style={layoutStyles.label}>Cuenta Bancaria</label>
                   {soloLectura ? (
-                    <div style={layoutStyles.readOnlyValue}>{this.state.banco || '—'}</div>
+                    <div style={layoutStyles.readOnlyValue}>
+                      {this._getCuentaBancariaDisplayValue() || '—'}
+                    </div>
                   ) : (
                     <select
                       style={{
                         ...layoutStyles.select,
                         ...(this.state.fieldErrors.banco ? layoutStyles.fieldInputError : {})
                       }}
-                      value={this.state.banco}
+                      value={this._getCuentaBancariaSelectValue()}
                       onChange={this._onCambiarBanco}
                       disabled={this.state.guardando}
                     >
                       <option value="">Seleccione...</option>
-                      {this.state.opcionesBanco.map((opcion: string) => (
-                        <option key={opcion} value={opcion}>
-                          {opcion}
+                      {this.state.cuentasBancarias.map((cuenta: ICuentaBancaria) => (
+                        <option key={cuenta.id} value={cuenta.id}>
+                          {getCuentaBancariaLabel(cuenta)}
                         </option>
                       ))}
+                      {!this.state.cuentaBancariaSeleccionada &&
+                        (this.state.bancoHistorico || '').trim() && (
+                        <option value="legacy">{this.state.bancoHistorico}</option>
+                      )}
                     </select>
                   )}
+                  {!soloLectura && this.state.cuentasBancariasError && (
+                    <div style={{ fontSize: 12, color: '#a4262c', marginTop: 4 }}>
+                      {this.state.cuentasBancariasError} El selector puede quedar incompleto.
+                    </div>
+                  )}
+                  {!soloLectura &&
+                    !this.state.cuentasBancariasError &&
+                    this.state.cuentasBancarias.length === 0 && (
+                      <div style={{ fontSize: 12, color: '#605e5c', marginTop: 4 }}>
+                        No hay cuentas bancarias activas configuradas.
+                      </div>
+                    )}
                   {this._renderFieldError(this.state.fieldErrors.banco)}
                 </div>
               )}
@@ -2819,6 +3752,8 @@ export default class RegistroPagosForm extends React.Component<IRegistroPagosFor
                 )}
                 {this._renderFieldError(this.state.fieldErrors.monto)}
               </div>
+
+              {this._renderCamposDesgloseRecupero()}
 
               <div style={layoutStyles.fieldGroup}>
                 <label style={layoutStyles.label}>Moneda</label>

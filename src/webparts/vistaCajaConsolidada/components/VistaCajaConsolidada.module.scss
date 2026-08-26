@@ -1,0 +1,223 @@
+@import '~@fluentui/react/dist/sass/References.scss';
+
+.vistaCajaConsolidada {
+  overflow: hidden;
+  padding: 1em;
+  color: "[theme:bodyText, default: #323130]";
+  color: var(--bodyText);
+  font-family: "Segoe UI", "Segoe UI Web (West European)", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+}
+
+.header {
+  margin-bottom: 16px;
+}
+
+.title {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 600;
+  color: #232529;
+}
+
+.subtitle {
+  margin: 0;
+  font-size: 13px;
+  color: #605e5c;
+}
+
+.filtersRoot {
+  background: #fafafc;
+  border: 1px solid #e3e4e8;
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.filtersRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.filtersActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.switchGroup {
+  margin-right: auto;
+  display: flex;
+  align-items: center;
+
+  :global(.ms-Toggle) {
+    margin-bottom: 0;
+  }
+
+  :global(.ms-Label) {
+    font-size: 13px;
+    font-weight: 400;
+    color: #323130;
+  }
+}
+
+.fieldGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 160px;
+  flex: 1 1 160px;
+}
+
+.label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #605e5c;
+}
+
+.input,
+.select {
+  height: 32px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  padding: 0 10px;
+  font-size: 13px;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.btnPrimary,
+.btnDefault {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.btnPrimary {
+  background: #0078d4;
+  color: #fff;
+  border-color: #0078d4;
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+
+.btnDefault {
+  background: #fff;
+  color: #323130;
+  border-color: #c8c6c4;
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+
+.statusMessage {
+  padding: 12px 14px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.statusLoading,
+.statusEmpty {
+  background: #f3f2f1;
+  color: #605e5c;
+  border: 1px solid #edebe9;
+}
+
+.statusError {
+  background: #fde7e9;
+  color: #a4262c;
+  border: 1px solid #f1aeb5;
+}
+
+.tableOuter {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #e3e4e8;
+  border-radius: 12px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.th {
+  text-align: left;
+  padding: 10px 12px;
+  background: #fafafc;
+  border-bottom: 1px solid #e3e4e8;
+  font-weight: 600;
+  color: #605e5c;
+  white-space: nowrap;
+}
+
+.td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #f3f2f1;
+  vertical-align: top;
+  color: #323130;
+}
+
+.importeStacked {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.importeInline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.importeLine {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.estadoBadge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.estadoAlDia {
+  background: #dff6dd;
+  color: #0b6a0b;
+}
+
+.estadoParcial {
+  background: #fff4ce;
+  color: #8a6116;
+}
+
+.estadoPendiente {
+  background: #fde7e9;
+  color: #a4262c;
+}
+
+.estadoSinMovimientos {
+  background: #edebe9;
+  color: #605e5c;
+}
+
+.estadoDesconocido {
+  background: #f3f2f1;
+  color: #8a8886;
+}

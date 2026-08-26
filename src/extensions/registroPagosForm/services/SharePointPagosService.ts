@@ -1,5 +1,9 @@
 import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import { SPHttpClient, SPHttpClientResponse } from '@microsoft/sp-http';
+import {
+  filtrarLiquidacionesDisponibles,
+  ILiquidacionOperador
+} from '../../../shared/pagoLiquidacionUtils';
 import { IPagoSaldoItem } from '../../../shared/pagoSaldoUtils';
 import {
   buildRegistroPagoExpandFields,
@@ -14,6 +18,15 @@ import {
   normalizarTipoPagoRegistro
 } from '../../../shared/registroPagoPayload';
 import { IRegistroPagoPayload } from '../../../shared/registroPagoTypes';
+import {
+  buildCuentasBancariasSelectFields,
+  ICuentaBancaria,
+  ICuentasBancariasFieldMap,
+  mapSharePointItemToCuentaBancaria,
+  resolveCuentasBancariasFieldMap
+} from '../../../shared/cuentasBancariasUtils';
+
+export { ICuentaBancaria };
 
 export { IPagoSaldoItem };
 export { getEstadoByMedioPago } from '../../../shared/pagoMedioUtils';
@@ -27,17 +40,23 @@ export interface IRegistroPagoData {
   moneda: string;
   fechaPago: string;
   estado: string;
+  cuentaBancariaId?: number | null;
   banco?: string;
+  montoAplicadoViaje?: number | null;
+  montoGastosBancarios?: number | null;
+  porcentajeRecupero?: number | null;
   motivo?: string;
   cotizacion?: number;
   viajeTitulo?: string;
   pasajeroNombre?: string;
   concepto?: string;
   servicioAsociadoId?: number;
+  liquidacionOperadorId?: number | null;
 }
 
 export interface IRegistroPagoItem extends IRegistroPagoData {
   id: number;
+  liquidacionOperadorNombre?: string;
 }
 
 export interface IViajeLookupItem {
@@ -61,6 +80,8 @@ export interface IServicioViajeItem {
   operadorNombre: string;
 }
 
+export { ILiquidacionOperador };
+
 export interface IComprobanteItem {
   fileName: string;
   serverRelativeUrl: string;
@@ -83,12 +104,15 @@ const LISTA_PAGOS = 'Registro de Pagos';
 const LISTA_VIAJES = 'Registro de Viajes';
 const LISTA_PASAJEROS = 'Pasajeros';
 const LISTA_SERVICIOS_VIAJE = 'ServiciosViaje';
+const LISTA_CUENTAS_BANCARIAS = 'CuentasBancarias';
+const LISTA_LIQUIDACIONES = 'Liquidaciones Operador';
 
 export default class SharePointPagosService {
   private readonly _context: FormCustomizerContext;
   private readonly _webUrl: string;
   private _fieldMaps: { [listTitle: string]: IStringMap } = {};
   private _registroPagoFieldMap: IRegistroPagoFieldMap | undefined;
+  private _cuentasBancariasFieldMap: ICuentasBancariasFieldMap | undefined;
 
   public constructor(context: FormCustomizerContext) {
     this._context = context;
@@ -127,8 +151,14 @@ export default class SharePointPagosService {
       estado: shared.estado || '',
       fechaPago: shared.fechaPago,
       banco: shared.banco,
+      cuentaBancariaId: shared.cuentaBancariaId,
+      montoAplicadoViaje: shared.montoAplicadoViaje,
+      montoGastosBancarios: shared.montoGastosBancarios,
+      porcentajeRecupero: shared.porcentajeRecupero,
       motivo: shared.motivo,
-      cotizacion: shared.cotizacion
+      cotizacion: shared.cotizacion,
+      liquidacionOperadorId: shared.liquidacionOperadorId,
+      liquidacionOperadorNombre: shared.liquidacionOperadorNombre
     };
   }
 
@@ -136,6 +166,11 @@ export default class SharePointPagosService {
     const map = await this._getPagosFieldMap();
     const shared = this._toSharedPayload(data);
     const payload = buildRegistroPagoPayload(shared, map);
+    if (data.cuentaBancariaId !== undefined && !map.fieldExists.CuentaBancaria) {
+      throw new Error(
+        'La columna Lookup CuentaBancaria no existe en la lista Registro de Pagos.'
+      );
+    }
     // TEMP diagnóstico Concepto
     console.log('[Concepto pago] SharePointPagosService.createPago shared:', shared);
     console.log('[Concepto pago] SharePointPagosService.createPago payload:', payload);
@@ -154,6 +189,10 @@ export default class SharePointPagosService {
       fechaPago: data.fechaPago,
       estado: data.estado,
       banco: data.banco,
+      cuentaBancariaId: data.cuentaBancariaId,
+      montoAplicadoViaje: data.montoAplicadoViaje,
+      montoGastosBancarios: data.montoGastosBancarios,
+      porcentajeRecupero: data.porcentajeRecupero,
       motivo: data.motivo,
       cotizacion: data.cotizacion,
       servicioAsociadoId:
@@ -165,6 +204,11 @@ export default class SharePointPagosService {
     const map = await this._getPagosFieldMap();
     const shared = this._toSharedPayload(data);
     const payload = buildRegistroPagoPayload(shared, map);
+    if (data.cuentaBancariaId !== undefined && !map.fieldExists.CuentaBancaria) {
+      throw new Error(
+        'La columna Lookup CuentaBancaria no existe en la lista Registro de Pagos.'
+      );
+    }
     // TEMP diagnóstico Concepto
     console.log('[Concepto pago] SharePointPagosService.updatePago shared:', shared);
     console.log('[Concepto pago] SharePointPagosService.updatePago payload:', payload);
@@ -444,12 +488,107 @@ export default class SharePointPagosService {
         id: shared.id,
         tipoPago: shared.tipoPago,
         monto: shared.monto,
+        montoAplicadoViaje: shared.montoAplicadoViaje,
         moneda: shared.moneda,
         cotizacion: shared.cotizacion,
         servicioAsociadoId: shared.servicioViajeId,
-        concepto: shared.concepto
+        liquidacionOperadorId: shared.liquidacionOperadorId,
+        concepto: shared.concepto,
+        estado: shared.estado
       };
     });
+  }
+
+  public async getLiquidacionesByViaje(viajeId: number): Promise<ILiquidacionOperador[]> {
+    const map = await this._getLiquidacionesFieldMap();
+    const lookupField = map.ViajeAsociado;
+    const operadorLookup = map.Operador;
+    const selectFields = [
+      'Id',
+      'Title',
+      map.Monto,
+      map.Moneda,
+      lookupField + '/Id',
+      operadorLookup + '/Id',
+      operadorLookup + '/Title'
+    ];
+    const baseUrl =
+      "/_api/web/lists/getByTitle('" +
+      LISTA_LIQUIDACIONES +
+      "')/items?$select=" +
+      encodeURIComponent(selectFields.join(',')) +
+      '&$expand=' +
+      encodeURIComponent(lookupField + ',' + operadorLookup);
+
+    const lookupFilterUrl = this._buildUrl(
+      baseUrl + '&$filter=' + encodeURIComponent(lookupField + '/Id eq ' + viajeId)
+    );
+    let json: any;
+    try {
+      json = await this._get(lookupFilterUrl);
+    } catch (error) {
+      const simpleFilterUrl = this._buildUrl(
+        baseUrl + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId)
+      );
+      json = await this._get(simpleFilterUrl);
+    }
+
+    const values = this._getResults(json);
+    return values.map((item: any) => this._mapLiquidacionItem(item, map, viajeId));
+  }
+
+  public async getLiquidacionOperadorById(id: number): Promise<ILiquidacionOperador | null> {
+    if (!id || id <= 0) {
+      return null;
+    }
+
+    const map = await this._getLiquidacionesFieldMap();
+    const lookupField = map.ViajeAsociado;
+    const operadorLookup = map.Operador;
+    const selectFields = [
+      'Id',
+      'Title',
+      map.Monto,
+      map.Moneda,
+      lookupField + '/Id',
+      operadorLookup + '/Id',
+      operadorLookup + '/Title'
+    ];
+    const url = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_LIQUIDACIONES +
+        "')/items(" +
+        id +
+        ')?$select=' +
+        encodeURIComponent(selectFields.join(',')) +
+        '&$expand=' +
+        encodeURIComponent(lookupField + ',' + operadorLookup)
+    );
+
+    try {
+      const item: any = await this._get(url);
+      const viajeId = this._extractLookupId(item, lookupField) || undefined;
+      return this._mapLiquidacionItem(item, map, viajeId);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  public async getLiquidacionesOperadorDisponibles(
+    viajeId: number,
+    liquidacionIncluidaId?: number,
+    pagoIdExcluir?: number
+  ): Promise<ILiquidacionOperador[]> {
+    const [liquidaciones, pagos] = await Promise.all([
+      this.getLiquidacionesByViaje(viajeId),
+      this.getPagosSaldoByViaje(viajeId)
+    ]);
+    return filtrarLiquidacionesDisponibles(
+      liquidaciones,
+      pagos,
+      liquidacionIncluidaId,
+      pagoIdExcluir
+    );
   }
 
   public async getChoiceFieldOptions(listTitle: string, fieldInternalName: string): Promise<string[]> {
@@ -479,6 +618,69 @@ export default class SharePointPagosService {
     return this.getChoiceFieldOptions(LISTA_PAGOS, map.Banco || 'Banco');
   }
 
+  /**
+   * Cuentas activas de la lista CuentasBancarias.
+   * Filtra Activo = true en OData cuando la columna existe.
+   */
+  public async getCuentasBancarias(): Promise<ICuentaBancaria[]> {
+    const map = await this._getCuentasBancariasFieldMap();
+    const selectFields = buildCuentasBancariasSelectFields(map);
+    const baseUrl =
+      "/_api/web/lists/getByTitle('" +
+      LISTA_CUENTAS_BANCARIAS +
+      "')/items?$select=" +
+      encodeURIComponent(selectFields.join(',')) +
+      '&$orderby=Title&$top=5000';
+
+    let json: any;
+    if (map.Activo) {
+      const filteredUrl = this._buildUrl(
+        baseUrl + '&$filter=' + encodeURIComponent(map.Activo + ' eq 1')
+      );
+      try {
+        json = await this._get(filteredUrl);
+      } catch (error) {
+        console.warn(
+          '[CuentasBancarias] Filtro OData Activo eq 1 falló; se reintenta sin filtro.',
+          error
+        );
+        json = await this._get(this._buildUrl(baseUrl));
+      }
+    } else {
+      json = await this._get(this._buildUrl(baseUrl));
+    }
+
+    const values = this._getResults(json);
+    const cuentas = values.map((item: any) => mapSharePointItemToCuentaBancaria(item, map));
+    if (map.Activo) {
+      return cuentas.filter((cuenta: ICuentaBancaria) => cuenta.activo);
+    }
+    return cuentas;
+  }
+
+  public async getCuentaBancariaById(id: number): Promise<ICuentaBancaria | undefined> {
+    if (!id || id <= 0) {
+      return undefined;
+    }
+    const map = await this._getCuentasBancariasFieldMap();
+    const selectFields = buildCuentasBancariasSelectFields(map);
+    const url = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_CUENTAS_BANCARIAS +
+        "')/items(" +
+        id +
+        ')?$select=' +
+        encodeURIComponent(selectFields.join(','))
+    );
+    try {
+      const item: any = await this._get(url);
+      return mapSharePointItemToCuentaBancaria(item, map);
+    } catch (error) {
+      console.warn('[CuentasBancarias] No se pudo leer la cuenta Id=' + id, error);
+      return undefined;
+    }
+  }
+
   public async getMotivoChoices(): Promise<string[]> {
     const map = await this._getPagosFieldMap();
     if (!map.fieldExists.Motivo) {
@@ -490,8 +692,9 @@ export default class SharePointPagosService {
   private _toSharedPayload(data: IRegistroPagoData): IRegistroPagoPayload {
     const tituloViaje = (data.viajeTitulo || '').trim();
     const tituloPasajero = (data.pasajeroNombre || '').trim();
+    const tituloConcepto = (data.concepto || '').trim();
     const shared: IRegistroPagoPayload = {
-      title: tituloViaje || tituloPasajero || 'Registro de Pago',
+      title: tituloViaje || tituloPasajero || tituloConcepto || 'Registro de Pago',
       concepto: data.concepto && data.concepto.trim() ? data.concepto.trim() : null,
       monto: data.monto,
       tipoPago: data.tipoPago,
@@ -499,7 +702,6 @@ export default class SharePointPagosService {
       fechaPago: data.fechaPago,
       moneda: data.moneda,
       estado: data.estado,
-      banco: data.banco && data.banco.trim() ? data.banco : null,
       motivo: data.motivo && data.motivo.trim() ? data.motivo : null,
       cotizacion:
         data.cotizacion !== undefined && data.cotizacion !== null && data.cotizacion > 0
@@ -509,11 +711,57 @@ export default class SharePointPagosService {
       pasajeroId: data.pasajeroId > 0 ? data.pasajeroId : null
     };
 
+    if (data.cuentaBancariaId !== undefined) {
+      shared.cuentaBancariaId =
+        data.cuentaBancariaId && data.cuentaBancariaId > 0 ? data.cuentaBancariaId : null;
+    }
+
+    if (data.montoAplicadoViaje !== undefined) {
+      shared.montoAplicadoViaje = data.montoAplicadoViaje;
+    }
+    if (data.montoGastosBancarios !== undefined) {
+      shared.montoGastosBancarios = data.montoGastosBancarios;
+    }
+    if (data.porcentajeRecupero !== undefined) {
+      shared.porcentajeRecupero = data.porcentajeRecupero;
+    }
+
     if (data.servicioAsociadoId !== undefined) {
       shared.servicioViajeId = data.servicioAsociadoId > 0 ? data.servicioAsociadoId : null;
     }
 
+    if (data.liquidacionOperadorId !== undefined) {
+      shared.liquidacionOperadorId =
+        data.liquidacionOperadorId && data.liquidacionOperadorId > 0
+          ? data.liquidacionOperadorId
+          : null;
+    }
+
     return shared;
+  }
+
+  private _mapLiquidacionItem(item: any, map: IStringMap, viajeId?: number): ILiquidacionOperador {
+    const operadorLookup = map.Operador;
+    return {
+      id: item.Id as number,
+      title: this._getString(item, 'Title'),
+      viajeId,
+      operadorId: this._extractLookupId(item, operadorLookup) || undefined,
+      operadorNombre: item[operadorLookup]
+        ? this._getString(item[operadorLookup], 'Title')
+        : undefined,
+      moneda: this._getString(item, map.Moneda),
+      importeTotal: this._toNumber(item[map.Monto])
+    };
+  }
+
+  private async _getLiquidacionesFieldMap(): Promise<IStringMap> {
+    return this._getFieldMap(LISTA_LIQUIDACIONES, {
+      ViajeAsociado: 'ViajeAsociado',
+      Monto: 'Monto',
+      Moneda: 'Moneda',
+      Operador: 'Operador'
+    });
   }
 
   private async _getPagosFieldMap(): Promise<IRegistroPagoFieldMap> {
@@ -528,8 +776,24 @@ export default class SharePointPagosService {
     );
     const json: any = await this._get(fieldsUrl);
     const fields: ISharePointListFieldMeta[] = this._getResults(json);
-    this._registroPagoFieldMap = resolveRegistroPagoFieldMap(fields);
+    this._registroPagoFieldMap = resolveRegistroPagoFieldMap(fields, { log: false });
     return this._registroPagoFieldMap;
+  }
+
+  private async _getCuentasBancariasFieldMap(): Promise<ICuentasBancariasFieldMap> {
+    if (this._cuentasBancariasFieldMap) {
+      return this._cuentasBancariasFieldMap;
+    }
+
+    const fieldsUrl = this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_CUENTAS_BANCARIAS +
+        "')/fields?$select=Title,InternalName,TypeAsString,Hidden"
+    );
+    const json: any = await this._get(fieldsUrl);
+    const fields: ISharePointListFieldMeta[] = this._getResults(json);
+    this._cuentasBancariasFieldMap = resolveCuentasBancariasFieldMap(fields);
+    return this._cuentasBancariasFieldMap;
   }
 
   private async _getViajesFieldMap(): Promise<IStringMap> {

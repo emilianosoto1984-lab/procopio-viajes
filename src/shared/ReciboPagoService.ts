@@ -4,9 +4,12 @@ import PdfGeneratorService from './PdfGeneratorService';
 import SharePointAttachmentService from './SharePointAttachmentService';
 import { formatDateDisplay } from './sharePointDateUtils';
 import {
+  buildFilaCotizacionReciboHtml,
+  buildFilaCuentaBancariaReciboHtml,
+  buildFilasImporteReciboHtml,
   buildNumeroRecibo,
   buildReciboFileName,
-  formatMontoRecibo
+  resolverCuentaBancariaParaRecibo
 } from './reciboPagoUtils';
 
 const LISTA_PAGOS = 'Registro de Pagos';
@@ -25,9 +28,18 @@ export interface IReciboPagoGeneracionData {
   nombreApellido: string;
   dni: string;
   concepto: string;
+  /** Importe total recibido (columna Monto). */
   monto: number;
   moneda: string;
   formaPago: string;
+  /** Label descriptivo (mismo helper que el formulario). Vacío = no mostrar fila. */
+  cuentaBancaria?: string;
+  /** Valores persistidos; el PDF no recalcula. */
+  montoAplicadoViaje?: number | null;
+  montoGastosBancarios?: number | null;
+  porcentajeRecupero?: number | null;
+  /** ARS por 1 USD. Solo se imprime si es mayor a 0. */
+  cotizacion?: number | null;
 }
 
 export interface IReciboPagoGeneracionResult {
@@ -158,6 +170,10 @@ export default class ReciboPagoService {
     numeroRecibo: string,
     fileName: string
   ): Promise<IReciboPagoGeneracionResult> {
+    const cuentaBancaria = resolverCuentaBancariaParaRecibo({
+      medioPago: data.formaPago,
+      cuentaLabel: data.cuentaBancaria
+    });
     const template = await this._templateService.getTemplate(TEMPLATE_PATH);
     const html = this._templateService.renderTemplate(template, {
       LogoEmpresa: this._templateService.getFileAbsoluteUrl(LOGO_PATH),
@@ -166,8 +182,16 @@ export default class ReciboPagoService {
       NombreApellido: data.nombreApellido,
       DNI: data.dni,
       Concepto: data.concepto,
-      Monto: formatMontoRecibo(data.monto, data.moneda),
-      FormaPago: data.formaPago
+      FormaPago: data.formaPago,
+      FilaCuentaBancaria: buildFilaCuentaBancariaReciboHtml(cuentaBancaria),
+      FilasImporte: buildFilasImporteReciboHtml({
+        monto: data.monto,
+        moneda: data.moneda,
+        montoAplicadoViaje: data.montoAplicadoViaje,
+        montoGastosBancarios: data.montoGastosBancarios,
+        porcentajeRecupero: data.porcentajeRecupero
+      }),
+      FilaCotizacion: buildFilaCotizacionReciboHtml(data.cotizacion)
     });
 
     const pdfBlob = await this._pdfGenerator.generate(html);

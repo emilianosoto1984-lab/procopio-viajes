@@ -19,7 +19,22 @@ export interface IRegistroPagoPayload {
   servicioViajeId?: number | null;
   pasajeroId?: number | null;
   estado?: string;
+  /**
+   * Lookup a CuentasBancarias. `null` limpia el valor.
+   * No usar el Choice Banco como identificador.
+   */
+  cuentaBancariaId?: number | null;
+  /**
+   * Choice/texto legacy. Solo lectura histórica / Viajes.
+   * RegistroPagosForm ya no lo escribe.
+   */
   banco?: string | null;
+  /** Neto aplicado al viaje/servicio (Monto ya incluye recupero). */
+  montoAplicadoViaje?: number | null;
+  /** Porción del Monto correspondiente a recupero bancario. */
+  montoGastosBancarios?: number | null;
+  /** % histórico aplicado al crear/editar el pago. */
+  porcentajeRecupero?: number | null;
   motivo?: string | null;
   liquidacionOperadorId?: number | null;
   observaciones?: string | null;
@@ -41,7 +56,15 @@ export interface IRegistroPagoItem {
   /** Nombre del lookup Pasajero (solo lectura / UI). */
   pasajeroNombre?: string;
   estado?: string;
+  /** Lookup CuentasBancarias (fuente de verdad). */
+  cuentaBancariaId?: number | null;
+  /** Título del lookup (solo lectura / UI). */
+  cuentaBancariaTitulo?: string;
+  /** Choice/texto legacy. Solo fallback histórico. */
   banco?: string;
+  montoAplicadoViaje?: number | null;
+  montoGastosBancarios?: number | null;
+  porcentajeRecupero?: number | null;
   motivo?: string;
   liquidacionOperadorId?: number;
   liquidacionOperadorNombre?: string;
@@ -64,6 +87,10 @@ export const REGISTRO_PAGO_EXPECTED_FIELDS = [
   'Pasajero',
   'Estado',
   'Banco',
+  'CuentaBancaria',
+  'MontoAplicadoViaje',
+  'MontoGastosBancarios',
+  'PorcentajeRecupero',
   'Motivo',
   'LiquidacionOperador',
   'Observaciones'

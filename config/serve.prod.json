@@ -14,6 +14,9 @@
         }
       }
     },
+    "vistaCajaConsolidada": {
+  "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/workbench.aspx"
+},
     "procopioForms_NewForm": {
       "pageUrl": "https://procopioturismo.sharepoint.com/sites/Dev-Viajes/_layouts/15/SPListForm.aspx",
       "formCustomizer": {

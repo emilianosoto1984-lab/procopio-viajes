@@ -40,7 +40,13 @@ export interface IRegistroPagoFieldMap {
   ServicioViaje: string;
   Pasajero: string;
   Estado: string;
+  /** Choice/texto legacy. */
   Banco: string;
+  /** Lookup a CuentasBancarias. */
+  CuentaBancaria: string;
+  MontoAplicadoViaje: string;
+  MontoGastosBancarios: string;
+  PorcentajeRecupero: string;
   Motivo: string;
   LiquidacionOperador: string;
   Observaciones: string;
@@ -50,6 +56,31 @@ export interface IRegistroPagoFieldMap {
 
 const DISPLAY_NAME_ALIASES: { [key: string]: string[] } = {
   Banco: ['Banco', 'Cuenta Bancaria'],
+  CuentaBancaria: ['CuentaBancaria', 'Cuenta Bancaria', 'Cuenta_x0020_Bancaria'],
+  MontoAplicadoViaje: [
+    'MontoAplicadoViaje',
+    'Monto Aplicado Viaje',
+    'Monto_x0020_Aplicado_x0020_Viaje'
+  ],
+  MontoGastosBancarios: [
+    // Nombre confirmado por el usuario (InternalName).
+    'RecuperoGastosBancarios',
+    'Recupero Gastos Bancarios',
+    'Recupero de Gastos Bancarios',
+    'Recupero de gastos bancarios',
+    'Recupero_x0020_Gastos_x0020_Bancarios',
+    'Recupero_x0020_de_x0020_Gastos_x0020_Bancarios',
+    'Recupero_x0020_de_x0020_gastos_x0020_bancarios',
+    // Alias de diseño original / legacy.
+    'MontoGastosBancarios',
+    'Monto Gastos Bancarios',
+    'Monto_x0020_Gastos_x0020_Bancarios'
+  ],
+  PorcentajeRecupero: [
+    'PorcentajeRecupero',
+    'Porcentaje Recupero',
+    'Porcentaje_x0020_Recupero'
+  ],
   Motivo: ['Motivo', 'Motivo de elección'],
   Concepto: ['Concepto'],
   Monto: ['Monto'],
@@ -102,25 +133,102 @@ function findField(
   fields: ISharePointListFieldMeta[],
   logicalKey: string
 ): ISharePointListFieldMeta | undefined {
-  const byInternal = fields.filter(
-    (field: ISharePointListFieldMeta) => field.InternalName === logicalKey
-  )[0];
-  if (byInternal) {
-    return byInternal;
-  }
+  return findFieldMatching(fields, logicalKey);
+}
 
+function isLookupType(field: ISharePointListFieldMeta): boolean {
+  return (field.TypeAsString || '').toLowerCase().indexOf('lookup') >= 0;
+}
+
+function findFieldMatching(
+  fields: ISharePointListFieldMeta[],
+  logicalKey: string,
+  predicate?: (field: ISharePointListFieldMeta) => boolean
+): ISharePointListFieldMeta | undefined {
   const aliases = DISPLAY_NAME_ALIASES[logicalKey] || [logicalKey];
+  const matches = (field: ISharePointListFieldMeta): boolean => !predicate || predicate(field);
+
+  for (let i = 0; i < aliases.length; i++) {
+    const alias = aliases[i];
+    const byInternal = fields.filter(
+      (field: ISharePointListFieldMeta) =>
+        field.InternalName === alias && matches(field)
+    )[0];
+    if (byInternal) {
+      return byInternal;
+    }
+  }
   for (let i = 0; i < aliases.length; i++) {
     const alias = aliases[i];
     const byTitle = fields.filter(
-      (field: ISharePointListFieldMeta) => field.Title === alias
+      (field: ISharePointListFieldMeta) => field.Title === alias && matches(field)
     )[0];
     if (byTitle) {
       return byTitle;
     }
   }
 
+  // Match case-insensitive / sin espacios (p. ej. RecuperoGastosBancarios vs Recupero gastos...).
+  const normalizedAliases = aliases.map((alias: string) => normalizeFieldToken(alias));
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i];
+    if (!matches(field)) {
+      continue;
+    }
+    const internalNorm = normalizeFieldToken(field.InternalName || '');
+    const titleNorm = normalizeFieldToken(field.Title || '');
+    if (
+      normalizedAliases.indexOf(internalNorm) >= 0 ||
+      normalizedAliases.indexOf(titleNorm) >= 0
+    ) {
+      return field;
+    }
+  }
+
   return undefined;
+}
+
+/** Normaliza nombre de columna para comparación flexible. */
+function normalizeFieldToken(value: string): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/á/g, 'a')
+    .replace(/é/g, 'e')
+    .replace(/í/g, 'i')
+    .replace(/ó/g, 'o')
+    .replace(/ú/g, 'u')
+    .replace(/ñ/g, 'n')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Fallback específico: cualquier Number cuyo nombre contenga recupero+gasto(s).
+ */
+function findRecuperoGastosBancariosField(
+  fields: ISharePointListFieldMeta[]
+): ISharePointListFieldMeta | undefined {
+  const candidates = (fields || []).filter((field: ISharePointListFieldMeta) => {
+    const token = normalizeFieldToken(
+      (field.InternalName || '') + ' ' + (field.Title || '')
+    );
+    const hasName =
+      token.indexOf('recuperogastos') >= 0 ||
+      (token.indexOf('recupero') >= 0 && token.indexOf('gasto') >= 0) ||
+      token.indexOf('montogastosbancarios') >= 0;
+    if (!hasName) {
+      return false;
+    }
+    const type = (field.TypeAsString || '').toLowerCase();
+    if (!type) {
+      return true;
+    }
+    return type === 'number' || type === 'currency' || type.indexOf('number') >= 0;
+  });
+  const exact = candidates.filter(
+    (field: ISharePointListFieldMeta) =>
+      normalizeFieldToken(field.InternalName || '') === 'recuperogastosbancarios'
+  )[0];
+  return exact || candidates[0];
 }
 
 /**
@@ -240,6 +348,8 @@ export function resolveRegistroPagoFieldMap(
   const visibleFields = fields.filter(
     (field: ISharePointListFieldMeta) => field.Hidden !== true
   );
+  // Columnas de recupero: incluir también Hidden (a veces se crean ocultas en la lista).
+  const fieldsForRecupero = fields || [];
 
   const titleField =
     fields.filter(
@@ -280,7 +390,25 @@ export function resolveRegistroPagoFieldMap(
   const servicioField = findField(visibleFields, 'ServicioViaje');
   const pasajeroField = findField(visibleFields, 'Pasajero');
   const estadoField = findField(visibleFields, 'Estado');
-  const bancoField = findField(visibleFields, 'Banco');
+  const bancoField = findFieldMatching(
+    visibleFields,
+    'Banco',
+    (field: ISharePointListFieldMeta) => !isLookupType(field)
+  );
+  const cuentaBancariaField =
+    findFieldMatching(visibleFields, 'CuentaBancaria', isLookupType) ||
+    findFieldMatching(visibleFields, 'CuentaBancaria');
+  const montoAplicadoViajeField =
+    findField(visibleFields, 'MontoAplicadoViaje') ||
+    findField(fieldsForRecupero, 'MontoAplicadoViaje');
+  const montoGastosBancariosField =
+    findField(visibleFields, 'MontoGastosBancarios') ||
+    findField(fieldsForRecupero, 'MontoGastosBancarios') ||
+    findRecuperoGastosBancariosField(visibleFields) ||
+    findRecuperoGastosBancariosField(fieldsForRecupero);
+  const porcentajeRecuperoField =
+    findField(visibleFields, 'PorcentajeRecupero') ||
+    findField(fieldsForRecupero, 'PorcentajeRecupero');
   const motivoField = findField(visibleFields, 'Motivo');
   const liquidacionField = findField(visibleFields, 'LiquidacionOperador');
   const observacionesField = findField(visibleFields, 'Observaciones');
@@ -314,6 +442,26 @@ export function resolveRegistroPagoFieldMap(
     }
     if (key === 'Concepto') {
       fieldExists[key] = !!conceptoField;
+      return;
+    }
+    if (key === 'CuentaBancaria') {
+      fieldExists[key] = !!cuentaBancariaField;
+      return;
+    }
+    if (key === 'Banco') {
+      fieldExists[key] = !!bancoField;
+      return;
+    }
+    if (key === 'MontoAplicadoViaje') {
+      fieldExists[key] = !!montoAplicadoViajeField;
+      return;
+    }
+    if (key === 'MontoGastosBancarios') {
+      fieldExists[key] = !!montoGastosBancariosField;
+      return;
+    }
+    if (key === 'PorcentajeRecupero') {
+      fieldExists[key] = !!porcentajeRecuperoField;
       return;
     }
     const resolved = findField(visibleFields, key);
@@ -353,7 +501,19 @@ export function resolveRegistroPagoFieldMap(
     logFieldResolution('ServicioViaje', servicioField);
     logFieldResolution('Pasajero', pasajeroField);
     logFieldResolution('Estado', estadoField);
-    logFieldResolution('Banco', bancoField);
+    logFieldResolution(
+      'Banco',
+      bancoField,
+      bancoField ? 'Choice/texto legacy; no se usa como identificador' : undefined
+    );
+    logFieldResolution(
+      'CuentaBancaria',
+      cuentaBancariaField,
+      cuentaBancariaField ? 'Lookup canónico a CuentasBancarias' : undefined
+    );
+    logFieldResolution('MontoAplicadoViaje', montoAplicadoViajeField);
+    logFieldResolution('MontoGastosBancarios', montoGastosBancariosField);
+    logFieldResolution('PorcentajeRecupero', porcentajeRecuperoField);
     logFieldResolution('Motivo', motivoField);
     logFieldResolution('LiquidacionOperador', liquidacionField);
     logFieldResolution('Observaciones', observacionesField);
@@ -385,6 +545,16 @@ export function resolveRegistroPagoFieldMap(
     Pasajero: pasajeroField ? pasajeroField.InternalName : 'Pasajero',
     Estado: estadoField ? estadoField.InternalName : 'Estado',
     Banco: bancoField ? bancoField.InternalName : 'Banco',
+    CuentaBancaria: cuentaBancariaField ? cuentaBancariaField.InternalName : 'CuentaBancaria',
+    MontoAplicadoViaje: montoAplicadoViajeField
+      ? montoAplicadoViajeField.InternalName
+      : 'MontoAplicadoViaje',
+    MontoGastosBancarios: montoGastosBancariosField
+      ? montoGastosBancariosField.InternalName
+      : 'RecuperoGastosBancarios',
+    PorcentajeRecupero: porcentajeRecuperoField
+      ? porcentajeRecuperoField.InternalName
+      : 'PorcentajeRecupero',
     Motivo: motivoField ? motivoField.InternalName : 'Motivo',
     LiquidacionOperador: liquidacionField
       ? liquidacionField.InternalName
@@ -428,6 +598,19 @@ export function buildRegistroPagoSelectFields(fieldMap: IRegistroPagoFieldMap): 
   if (fieldMap.fieldExists.Banco) {
     pushUnique(fieldMap.Banco);
   }
+  if (fieldMap.fieldExists.MontoAplicadoViaje) {
+    pushUnique(fieldMap.MontoAplicadoViaje);
+  }
+  if (fieldMap.fieldExists.MontoGastosBancarios) {
+    pushUnique(fieldMap.MontoGastosBancarios);
+  }
+  if (fieldMap.fieldExists.PorcentajeRecupero) {
+    pushUnique(fieldMap.PorcentajeRecupero);
+  }
+  if (fieldMap.fieldExists.CuentaBancaria) {
+    pushUnique(fieldMap.CuentaBancaria + '/Id');
+    pushUnique(fieldMap.CuentaBancaria + '/Title');
+  }
   if (fieldMap.fieldExists.Motivo) {
     pushUnique(fieldMap.Motivo);
   }
@@ -456,6 +639,9 @@ export function buildRegistroPagoExpandFields(fieldMap: IRegistroPagoFieldMap): 
   const expand: string[] = [fieldMap.ViajeAsociado];
   if (fieldMap.fieldExists.Pasajero) {
     expand.push(fieldMap.Pasajero);
+  }
+  if (fieldMap.fieldExists.CuentaBancaria) {
+    expand.push(fieldMap.CuentaBancaria);
   }
   if (fieldMap.fieldExists.ServicioViaje) {
     expand.push(fieldMap.ServicioViaje);

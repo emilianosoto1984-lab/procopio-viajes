@@ -5,8 +5,10 @@ export const RECIBO_PAGO_TEMPLATE_PLACEHOLDERS = [
   'NombreApellido',
   'DNI',
   'Concepto',
-  'Monto',
-  'FormaPago'
+  'FormaPago',
+  'FilaCuentaBancaria',
+  'FilasImporte',
+  'FilaCotizacion'
 ] as const;
 
 export type ReciboPagoTemplatePlaceholder = typeof RECIBO_PAGO_TEMPLATE_PLACEHOLDERS[number];

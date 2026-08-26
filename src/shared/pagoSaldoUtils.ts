@@ -2,15 +2,20 @@ import {
   normalizarMonedaPago,
   normalizarMonedaServicio
 } from './pagoMonedaUtils';
+import { getMontoQueAplicaAlViaje } from './pagoRecuperoUtils';
 
 export interface IPagoSaldoItem {
   id: number;
   tipoPago: string;
   monto: number;
+  /** Neto aplicado al viaje; si falta, el saldo usa `monto`. */
+  montoAplicadoViaje?: number | null;
   moneda: string;
   cotizacion?: number;
   servicioAsociadoId?: number;
+  liquidacionOperadorId?: number;
   concepto?: string;
+  estado?: string;
 }
 
 export interface IServicioSaldoItem {
@@ -18,6 +23,15 @@ export interface IServicioSaldoItem {
   concepto: string;
   precioCliente: number;
   moneda: string;
+}
+
+/**
+ * Solo pagos Aprobados (y históricos sin Estado) impactan saldos/totales.
+ * Misma regla que Registro de Viajes.
+ */
+export function isPagoConsideradoEnTotales(pago: { estado?: string }): boolean {
+  const estado = (pago.estado || '').trim().toLowerCase();
+  return estado === '' || estado === 'aprobado';
 }
 
 /**
@@ -71,8 +85,9 @@ export function getTotalIngresosPorServicioEnMonedaServicio(
   return pagos
     .filter(
       (pago: IPagoSaldoItem) =>
+        isPagoConsideradoEnTotales(pago) &&
         (pago.tipoPago || '').trim() === 'Ingreso' &&
-        pago.monto > 0 &&
+        getMontoQueAplicaAlViaje(pago) > 0 &&
         pagoMatchesServicio(pago, servicio) &&
         (pagoIdExcluir === undefined || pago.id !== pagoIdExcluir)
     )
@@ -80,7 +95,7 @@ export function getTotalIngresosPorServicioEnMonedaServicio(
       (acc: number, pago: IPagoSaldoItem) =>
         acc +
         convertirIngresoAMonedaServicio(
-          pago.monto,
+          getMontoQueAplicaAlViaje(pago),
           pago.moneda,
           pago.cotizacion,
           servicio.moneda
@@ -102,14 +117,15 @@ export function getSaldoPendienteServicio(
 export function montoExcedeSaldoPendiente(
   servicio: IServicioSaldoItem,
   pagos: IPagoSaldoItem[],
-  montoPago: number,
+  /** Monto que aplica al viaje (neto si hay recupero; bruto si no). */
+  montoAplicadoAlViaje: number,
   monedaPago: string,
   cotizacion: number | undefined,
   pagoIdExcluir?: number
 ): boolean {
   const totalYaIngresado = getTotalIngresosPorServicioEnMonedaServicio(servicio, pagos, pagoIdExcluir);
   const ingresoConvertido = convertirIngresoAMonedaServicio(
-    montoPago,
+    montoAplicadoAlViaje,
     monedaPago,
     cotizacion,
     servicio.moneda

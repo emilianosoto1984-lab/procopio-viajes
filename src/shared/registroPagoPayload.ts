@@ -177,13 +177,65 @@ export function buildRegistroPagoPayload(
     }
   }
 
+  if (data.cuentaBancariaId !== undefined && fieldMap.fieldExists.CuentaBancaria) {
+    const cuentaId = resolveLookupPayloadValue(data.cuentaBancariaId);
+    if (cuentaId !== undefined) {
+      payload[fieldMap.CuentaBancaria + 'Id'] = cuentaId;
+    }
+  }
+
   if (data.estado !== undefined) {
     setIfFieldExists(payload, fieldMap.Estado, fieldMap.fieldExists.Estado, data.estado);
   }
 
+  // Choice Banco: solo si el caller lo envía (Viajes / legado). RegistroPagosForm ya no escribe.
   if (data.banco !== undefined && fieldMap.fieldExists.Banco) {
     const banco = (data.banco || '').trim();
     payload[fieldMap.Banco] = banco || null;
+  }
+
+    if (data.montoGastosBancarios !== undefined) {
+      const recuperoFieldName = fieldMap.fieldExists.MontoGastosBancarios
+        ? fieldMap.MontoGastosBancarios
+        : 'RecuperoGastosBancarios';
+      if (!fieldMap.fieldExists.MontoGastosBancarios) {
+        console.warn(
+          '[RegistroPago] Columna de recupero no resuelta en field map; ' +
+            'escribiendo fallback InternalName=RecuperoGastosBancarios'
+        );
+      }
+      if (data.montoGastosBancarios === null) {
+        payload[recuperoFieldName] = null;
+      } else {
+        payload[recuperoFieldName] = data.montoGastosBancarios;
+      }
+    }
+
+  if (data.porcentajeRecupero !== undefined && fieldMap.fieldExists.PorcentajeRecupero) {
+    if (data.porcentajeRecupero === null) {
+      payload[fieldMap.PorcentajeRecupero] = null;
+    } else {
+      payload[fieldMap.PorcentajeRecupero] = data.porcentajeRecupero;
+    }
+  } else if (data.porcentajeRecupero !== undefined && !fieldMap.fieldExists.PorcentajeRecupero) {
+    console.warn(
+      '[RegistroPago] No se pudo persistir PorcentajeRecupero: columna no encontrada en «Registro de Pagos».'
+    );
+  }
+
+  if (data.montoAplicadoViaje !== undefined && fieldMap.fieldExists.MontoAplicadoViaje) {
+    if (data.montoAplicadoViaje === null) {
+      payload[fieldMap.MontoAplicadoViaje] = null;
+    } else {
+      payload[fieldMap.MontoAplicadoViaje] = data.montoAplicadoViaje;
+    }
+  } else if (
+    data.montoAplicadoViaje !== undefined &&
+    !fieldMap.fieldExists.MontoAplicadoViaje
+  ) {
+    console.warn(
+      '[RegistroPago] No se pudo persistir MontoAplicadoViaje: columna no encontrada en «Registro de Pagos».'
+    );
   }
 
   if (data.motivo !== undefined && fieldMap.fieldExists.Motivo) {
@@ -237,6 +289,12 @@ export function mapSharePointItemToRegistroPago(
   const pasajeroNombre = fieldMap.fieldExists.Pasajero
     ? extractLookupTitle(item, fieldMap.Pasajero)
     : '';
+  const cuentaBancariaId = fieldMap.fieldExists.CuentaBancaria
+    ? extractLookupId(item, fieldMap.CuentaBancaria)
+    : 0;
+  const cuentaBancariaTitulo = fieldMap.fieldExists.CuentaBancaria
+    ? extractLookupTitle(item, fieldMap.CuentaBancaria)
+    : '';
   const servicioViajeId = fieldMap.fieldExists.ServicioViaje
     ? extractLookupId(item, fieldMap.ServicioViaje)
     : 0;
@@ -275,7 +333,30 @@ export function mapSharePointItemToRegistroPago(
     pasajeroId: pasajeroId > 0 ? pasajeroId : null,
     pasajeroNombre: pasajeroNombre || undefined,
     estado: fieldMap.fieldExists.Estado ? getString(item, fieldMap.Estado) : undefined,
+    cuentaBancariaId: cuentaBancariaId > 0 ? cuentaBancariaId : null,
+    cuentaBancariaTitulo: cuentaBancariaTitulo || undefined,
     banco: fieldMap.fieldExists.Banco ? getString(item, fieldMap.Banco) : undefined,
+    montoAplicadoViaje: fieldMap.fieldExists.MontoAplicadoViaje
+      ? item[fieldMap.MontoAplicadoViaje] !== undefined &&
+        item[fieldMap.MontoAplicadoViaje] !== null &&
+        item[fieldMap.MontoAplicadoViaje] !== ''
+        ? toNumber(item[fieldMap.MontoAplicadoViaje])
+        : null
+      : undefined,
+    montoGastosBancarios: fieldMap.fieldExists.MontoGastosBancarios
+      ? item[fieldMap.MontoGastosBancarios] !== undefined &&
+        item[fieldMap.MontoGastosBancarios] !== null &&
+        item[fieldMap.MontoGastosBancarios] !== ''
+        ? toNumber(item[fieldMap.MontoGastosBancarios])
+        : null
+      : undefined,
+    porcentajeRecupero: fieldMap.fieldExists.PorcentajeRecupero
+      ? item[fieldMap.PorcentajeRecupero] !== undefined &&
+        item[fieldMap.PorcentajeRecupero] !== null &&
+        item[fieldMap.PorcentajeRecupero] !== ''
+        ? toNumber(item[fieldMap.PorcentajeRecupero])
+        : null
+      : undefined,
     motivo: fieldMap.fieldExists.Motivo ? getString(item, fieldMap.Motivo) : undefined,
     liquidacionOperadorId:
       liquidacionOperadorId > 0 ? liquidacionOperadorId : undefined,

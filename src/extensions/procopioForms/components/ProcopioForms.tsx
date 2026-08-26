@@ -2,6 +2,7 @@ import * as React from 'react';
 import { Log, FormDisplayMode } from '@microsoft/sp-core-library';
 import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import SharePointViajesService, {
+  ICuentaBancaria,
   IDestinoGeneralItem,
   IDestinoItem,
   ILiquidacionData,
@@ -38,8 +39,40 @@ import {
   resolverMotivoViaje
 } from '../../../shared/pagoMedioUtils';
 import { buildConceptoPagoConViaje } from '../../../shared/pagoConceptoUtils';
+import {
+  findCuentaBancariaById,
+  getCuentaBancariaLabel,
+  resolverCuentaBancariaHistorica
+} from '../../../shared/cuentasBancariasUtils';
+import {
+  calcularDesgloseRecuperoBancario,
+  formatPorcentajeRecuperoDisplay,
+  getMontoQueAplicaAlViaje,
+  IDesgloseRecuperoBancario
+} from '../../../shared/pagoRecuperoUtils';
+import {
+  formatMontoMoneda,
+  convertirIngresoAMonedaServicio,
+  IPagoSaldoItem
+} from '../../../shared/pagoSaldoUtils';
+import {
+  enriquecerLiquidacionConSaldo,
+  filtrarLiquidacionesDisponibles,
+  formatLiquidacionOperadorLabel,
+  formatSaldoLiquidacionDisplay,
+  ILiquidacionOperador,
+  montoExcedeSaldoPendienteLiquidacion
+} from '../../../shared/pagoLiquidacionUtils';
 import ReciboPagoService, { IReciboPagoGeneracionData } from '../../../shared/ReciboPagoService';
-import { debeGenerarReciboPago } from '../../../shared/reciboPagoUtils';
+import {
+  debeGenerarReciboPago,
+  resolverCuentaBancariaParaRecibo
+} from '../../../shared/reciboPagoUtils';
+import {
+  getTotalesIngresosPorMoneda as getTotalesIngresosPorMonedaShared,
+  getTotalesServiciosPorMoneda as getTotalesServiciosPorMonedaShared,
+  isPagoConsideradoEnTotales
+} from '../../../shared/pagoTotalesUtils';
 
 export interface IProcopioFormsProps {
   context: FormCustomizerContext;
@@ -101,7 +134,12 @@ interface IMovimiento {
   liquidacionOperadorId?: number;
   servicioAsociadoId?: number;
   liquidacionOperadorNombre?: string;
+  cuentaBancariaId?: number | null;
+  /** Texto Choice legacy (solo histórico). */
   banco?: string;
+  montoAplicadoViaje?: number | null;
+  montoGastosBancarios?: number | null;
+  porcentajeRecupero?: number | null;
   estado?: string;
   pasajeroId?: number;
   pasajeroNombre?: string;
@@ -123,15 +161,6 @@ function isMovimientoPendiente(movimiento: IMovimiento): boolean {
 
 function isMovimientoSinEstado(movimiento: IMovimiento): boolean {
   return normalizeEstado(movimiento.estado) === '';
-}
-
-/**
- * Solo movimientos Aprobados (y históricos sin Estado) impactan saldos/totales.
- * Pendientes se excluyen.
- */
-function isPagoConsideradoEnTotales(pago: { estado?: string }): boolean {
-  const estado = (pago.estado || '').trim().toLowerCase();
-  return estado === '' || estado === 'aprobado';
 }
 
 function contarMovimientosAprobados(movimientos: IMovimiento[]): number {
@@ -225,7 +254,12 @@ interface IProcopioFormsState {
     liquidacionOperadorId: string;
     servicioAsociadoId: string;
     fechaTexto: string;
-    banco: string;
+    cuentaBancariaId: string;
+    bancoHistorico: string;
+    desgloseRecuperoRecalcular: boolean;
+    montoAplicadoViajePersistido: number | null;
+    montoGastosBancariosPersistido: number | null;
+    porcentajeRecuperoPersistido: number | null;
     pasajeroId: string;
   };
   movimientoFieldErrors: {
@@ -234,9 +268,9 @@ interface IProcopioFormsState {
     pasajero: string;
   };
   movimientoEstadoView: MovimientoEstadoView;
-  opcionesBanco: string[];
-  opcionesBancoCargando: boolean;
-  opcionesBancoError: string;
+  cuentasBancarias: ICuentaBancaria[];
+  cuentasBancariasCargando: boolean;
+  cuentasBancariasError: string;
   opcionesMotivo: string[];
   opcionesMotivoError: string;
   reciboUrlByPagoId: { [pagoId: number]: string };
@@ -339,6 +373,18 @@ const layoutStyles: { [key: string]: React.CSSProperties } = {
   inlineEditor: { backgroundColor: '#faf9f8', borderRadius: 4, border: '1px dashed #c8c6c4', padding: 12, marginTop: 8 },
   inlineEditorRow: { display: 'flex', gap: 12, marginBottom: 8 },
   inlineEditorField: { flex: 1 },
+  readOnlyValue: {
+    minHeight: 38,
+    display: 'flex',
+    alignItems: 'center',
+    padding: '0 12px',
+    borderRadius: 4,
+    border: '1.4px solid #e1dfdd',
+    background: '#f3f2f1',
+    fontSize: 14,
+    color: '#323130',
+    boxSizing: 'border-box'
+  },
   bottomActions: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 },
   info: { marginBottom: 10, color: '#605e5c' },
   error: { color: '#a4262c', marginBottom: 10 },
@@ -399,7 +445,22 @@ const layoutStyles: { [key: string]: React.CSSProperties } = {
     color: '#323130',
     lineHeight: 1.35
   },
-  fileInputHint: { fontSize: 12, color: '#605e5c' }
+  fileInputHint: { fontSize: 12, color: '#605e5c' },
+  saldoPendienteInfo: {
+    marginTop: 6,
+    padding: '8px 10px',
+    borderRadius: 4,
+    background: '#f3f2f1',
+    border: '1px solid #e1dfdd',
+    fontSize: 12,
+    color: '#323130',
+    whiteSpace: 'pre-line'
+  },
+  saldoPendienteWarning: {
+    marginTop: 6,
+    fontSize: 12,
+    color: '#ca5010'
+  }
 };
 
 /** Border-radius tokens used only by the Pasajeros section (card > surface > controls). */
@@ -1055,14 +1116,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         cotizacion: '',
         liquidacionOperadorId: '',
         servicioAsociadoId: '',
-        banco: '',
+        cuentaBancariaId: '',
+        bancoHistorico: '',
+        desgloseRecuperoRecalcular: true,
+        montoAplicadoViajePersistido: null,
+        montoGastosBancariosPersistido: null,
+        porcentajeRecuperoPersistido: null,
         pasajeroId: ''
       },
       movimientoFieldErrors: { medioPago: '', banco: '', pasajero: '' },
       movimientoEstadoView: 'aprobados',
-      opcionesBanco: [],
-      opcionesBancoCargando: false,
-      opcionesBancoError: '',
+      cuentasBancarias: [],
+      cuentasBancariasCargando: false,
+      cuentasBancariasError: '',
       opcionesMotivo: [],
       opcionesMotivoError: '',
       reciboUrlByPagoId: {},
@@ -1181,7 +1247,14 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
             liquidacionOperadorId: p.liquidacionOperadorId,
             servicioAsociadoId: p.servicioAsociadoId,
             liquidacionOperadorNombre: p.liquidacionOperadorNombre,
-            banco: requiereCuentaBancaria(normalizarMedioPago(p.medioPago)) ? (p.banco || '') : '',
+            cuentaBancariaId:
+              p.cuentaBancariaId && p.cuentaBancariaId > 0 ? p.cuentaBancariaId : null,
+            banco: requiereCuentaBancaria(normalizarMedioPago(p.medioPago))
+              ? (p.banco || '')
+              : '',
+            montoAplicadoViaje: p.montoAplicadoViaje,
+            montoGastosBancarios: p.montoGastosBancarios,
+            porcentajeRecupero: p.porcentajeRecupero,
             estado: p.estado || '',
             pasajeroId: p.pasajeroId && p.pasajeroId > 0 ? p.pasajeroId : undefined,
             pasajeroNombre: p.pasajeroNombre || ''
@@ -1205,20 +1278,20 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
 
   private async _cargarOpcionesPagoChoices(): Promise<void> {
     this.setState({
-      opcionesBancoCargando: true,
-      opcionesBancoError: '',
+      cuentasBancariasCargando: true,
+      cuentasBancariasError: '',
       opcionesMotivoError: ''
     });
     try {
-      const [opcionesBanco, opcionesMotivo] = await Promise.all([
-        this._service.getBancoChoices(),
+      const [cuentasBancarias, opcionesMotivo] = await Promise.all([
+        this._service.getCuentasBancarias(),
         this._service.getMotivoChoices()
       ]);
       const motivoViaje = resolverMotivoViaje(opcionesMotivo);
       this.setState({
-        opcionesBanco,
-        opcionesBancoCargando: false,
-        opcionesBancoError: '',
+        cuentasBancarias,
+        cuentasBancariasCargando: false,
+        cuentasBancariasError: '',
         opcionesMotivo,
         opcionesMotivoError: motivoViaje
           ? ''
@@ -1233,9 +1306,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       }
     } catch (error) {
       this.setState({
-        opcionesBanco: [],
-        opcionesBancoCargando: false,
-        opcionesBancoError: 'No se pudieron cargar las cuentas bancarias.',
+        cuentasBancarias: [],
+        cuentasBancariasCargando: false,
+        cuentasBancariasError: 'No se pudieron cargar las cuentas bancarias.',
         opcionesMotivo: [],
         opcionesMotivoError:
           'No se pudieron cargar las opciones de Motivo desde SharePoint.'
@@ -1253,11 +1326,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     return parsed > 0 ? parsed : null;
   }
 
-  private _navegarAFormularioEdicion = (): void => {
-    const itemId = this._getItemId();
+  private _navegarAFormularioEdicion = (itemIdOverride?: number): boolean => {
+    const itemId = itemIdOverride && itemIdOverride > 0 ? itemIdOverride : this._getItemId();
     const listGuid = this.props.context.list?.guid?.toString();
     if (!itemId || !listGuid) {
-      return;
+      return false;
     }
     const webUrl = this.props.context.pageContext.web.absoluteUrl.replace(/\/$/, '');
     const url =
@@ -1267,6 +1340,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       '&ID=' +
       itemId;
     window.location.assign(url);
+    return true;
   };
 
   private _getPasajeroDisplayUrl(pasajeroId: number): string {
@@ -2196,7 +2270,12 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         cotizacion: '',
         liquidacionOperadorId: '',
         servicioAsociadoId: '',
-        banco: '',
+        cuentaBancariaId: '',
+        bancoHistorico: '',
+        desgloseRecuperoRecalcular: true,
+        montoAplicadoViajePersistido: null,
+        montoGastosBancariosPersistido: null,
+        porcentajeRecuperoPersistido: null,
         pasajeroId: this._resolverPasajeroIdInicialNuevoIngreso()
       }
     });
@@ -2220,6 +2299,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   private _onSeleccionarLiquidacionEgreso = (liquidacionIdRaw: string): void => {
     const liquidacionId = Number(liquidacionIdRaw);
     const liquidacion = this.state.liquidacionesOperador.filter((l: ILiquidacionItem) => l.id === liquidacionId)[0];
+    this._clearSectionError('movimientos');
     this.setState(prev => ({
       movimientoEnEdicion: {
         ...prev.movimientoEnEdicion,
@@ -2230,6 +2310,90 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       }
     }));
   };
+
+  private _mapLiquidacionOperador(liquidacion: ILiquidacionItem): ILiquidacionOperador {
+    return {
+      id: liquidacion.id,
+      title: liquidacion.codigoReferencia,
+      operadorId: liquidacion.operadorId,
+      operadorNombre: liquidacion.operadorNombre,
+      moneda: liquidacion.moneda,
+      importeTotal: liquidacion.monto
+    };
+  }
+
+  private _getPagosSaldoDesdeMovimientos(): IPagoSaldoItem[] {
+    return this.state.movimientos.map((m: IMovimiento) => ({
+      id: m.id,
+      tipoPago: m.tipo,
+      monto: m.monto,
+      montoAplicadoViaje: m.montoAplicadoViaje,
+      moneda: m.moneda,
+      cotizacion: m.cotizacion,
+      servicioAsociadoId: m.servicioAsociadoId,
+      liquidacionOperadorId: m.liquidacionOperadorId,
+      concepto: m.movimiento,
+      estado: m.estado
+    }));
+  }
+
+  private _getLiquidacionesEgresoParaSelector(): ILiquidacionOperador[] {
+    const liquidaciones = this.state.liquidacionesOperador
+      .filter((l: ILiquidacionItem) => l.id > 0 && !!(l.codigoReferencia || '').trim())
+      .map((l: ILiquidacionItem) => this._mapLiquidacionOperador(l));
+    const incluida = Number(this.state.movimientoEnEdicion.liquidacionOperadorId) || 0;
+    const pagoIdExcluir = this.state.movimientoEnEdicionId || undefined;
+    return filtrarLiquidacionesDisponibles(
+      liquidaciones,
+      this._getPagosSaldoDesdeMovimientos(),
+      incluida > 0 ? incluida : undefined,
+      pagoIdExcluir
+    );
+  }
+
+  private _getLiquidacionSeleccionadaEgreso(): ILiquidacionItem | undefined {
+    const liquidacionId = Number(this.state.movimientoEnEdicion.liquidacionOperadorId);
+    if (!liquidacionId || liquidacionId <= 0) {
+      return undefined;
+    }
+    return this.state.liquidacionesOperador.filter((l: ILiquidacionItem) => l.id === liquidacionId)[0];
+  }
+
+  private _renderSaldoPendienteLiquidacionMovimiento(): React.ReactNode {
+    if (this.state.movimientoEnEdicion.tipo !== 'Egreso') {
+      return null;
+    }
+    const liquidacion = this._getLiquidacionSeleccionadaEgreso();
+    if (!liquidacion) {
+      return null;
+    }
+    const pagoIdExcluir = this.state.movimientoEnEdicionId || undefined;
+    const enriquecida = enriquecerLiquidacionConSaldo(
+      this._mapLiquidacionOperador(liquidacion),
+      this._getPagosSaldoDesdeMovimientos(),
+      pagoIdExcluir
+    );
+    const saldoPendiente = enriquecida.saldoPendiente ?? 0;
+    if (saldoPendiente <= 0) {
+      return (
+        <div style={layoutStyles.saldoPendienteWarning}>
+          Esta liquidación no tiene saldo pendiente.
+        </div>
+      );
+    }
+    const cotizacion = this._requiereCotizacionMovimiento()
+      ? Number(this.state.movimientoEnEdicion.cotizacion)
+      : undefined;
+    return (
+      <div style={layoutStyles.saldoPendienteInfo}>
+        {formatSaldoLiquidacionDisplay(
+          enriquecida,
+          this.state.movimientoEnEdicion.moneda,
+          cotizacion
+        )}
+      </div>
+    );
+  }
 
   /** Concepto persistido: "{Servicio|Liquidación} - {Nombre del viaje}". */
   private _buildConceptoMovimientoConViaje(nombreBase: string): string {
@@ -2395,31 +2559,64 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     valor: string
   ): void => {
     this._clearSectionError('movimientos');
-    this.setState(prev => ({ movimientoEnEdicion: { ...prev.movimientoEnEdicion, [campo]: valor } }));
+    const recalcular =
+      campo === 'monto' || campo === 'moneda' || campo === 'medioPago' || campo === 'cuentaBancariaId';
+    this.setState(prev => ({
+      movimientoEnEdicion: {
+        ...prev.movimientoEnEdicion,
+        [campo]: valor,
+        ...(recalcular ? { desgloseRecuperoRecalcular: true } : {})
+      }
+    }));
   };
 
   private _onCambiarMedioPagoMovimiento = (medioPagoRaw: string): void => {
     const medioPago = normalizarMedioPago(medioPagoRaw);
-    const limpiaBanco = !requiereCuentaBancaria(medioPago);
+    const limpiaCuenta = !requiereCuentaBancaria(medioPago);
     this._clearSectionError('movimientos');
     this.setState(prev => ({
       movimientoEnEdicion: {
         ...prev.movimientoEnEdicion,
         medioPago,
-        banco: limpiaBanco ? '' : prev.movimientoEnEdicion.banco
+        cuentaBancariaId: limpiaCuenta ? '' : prev.movimientoEnEdicion.cuentaBancariaId,
+        bancoHistorico: limpiaCuenta ? '' : prev.movimientoEnEdicion.bancoHistorico,
+        desgloseRecuperoRecalcular: true
       },
       movimientoFieldErrors: {
         medioPago: '',
-        banco: limpiaBanco ? '' : prev.movimientoFieldErrors.banco,
+        banco: limpiaCuenta ? '' : prev.movimientoFieldErrors.banco,
         pasajero: prev.movimientoFieldErrors.pasajero
       }
     }));
   };
 
-  private _onCambiarBancoMovimiento = (banco: string): void => {
+  private _onCambiarCuentaBancariaMovimiento = (cuentaIdRaw: string): void => {
     this._clearSectionError('movimientos');
+    if (!cuentaIdRaw) {
+      this.setState(prev => ({
+        movimientoEnEdicion: {
+          ...prev.movimientoEnEdicion,
+          cuentaBancariaId: '',
+          bancoHistorico: '',
+          desgloseRecuperoRecalcular: true
+        },
+        movimientoFieldErrors: { ...prev.movimientoFieldErrors, banco: '' }
+      }));
+      return;
+    }
+    if (cuentaIdRaw === 'legacy') {
+      this.setState(prev => ({
+        movimientoFieldErrors: { ...prev.movimientoFieldErrors, banco: '' }
+      }));
+      return;
+    }
     this.setState(prev => ({
-      movimientoEnEdicion: { ...prev.movimientoEnEdicion, banco },
+      movimientoEnEdicion: {
+        ...prev.movimientoEnEdicion,
+        cuentaBancariaId: cuentaIdRaw,
+        bancoHistorico: '',
+        desgloseRecuperoRecalcular: true
+      },
       movimientoFieldErrors: { ...prev.movimientoFieldErrors, banco: '' }
     }));
   };
@@ -2444,7 +2641,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           movimiento: '',
           liquidacionOperadorId: '',
           servicioAsociadoId: '',
-          pasajeroId
+          pasajeroId: tipo === 'Egreso' ? '' : pasajeroId
         },
         movimientoFieldErrors: {
           ...prev.movimientoFieldErrors,
@@ -2468,6 +2665,20 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       const mov = prev.movimientos.filter((m: IMovimiento) => m.id === id)[0];
       if (!mov) { return prev; }
       const medioPago = normalizarMedioPago(mov.medioPago);
+      let cuentaBancariaId = '';
+      let bancoHistorico = '';
+      if (requiereCuentaBancaria(medioPago)) {
+        if (mov.cuentaBancariaId && mov.cuentaBancariaId > 0) {
+          cuentaBancariaId = String(mov.cuentaBancariaId);
+        } else if ((mov.banco || '').trim()) {
+          const match = resolverCuentaBancariaHistorica(prev.cuentasBancarias, mov.banco || '');
+          if (match.estado === 'unica' && match.cuenta) {
+            cuentaBancariaId = String(match.cuenta.id);
+          } else {
+            bancoHistorico = (mov.banco || '').trim();
+          }
+        }
+      }
       return {
         ...prev,
         mostrarEditorMovimiento: true,
@@ -2485,7 +2696,21 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           cotizacion: mov.cotizacion !== undefined ? String(mov.cotizacion) : '',
           liquidacionOperadorId: mov.liquidacionOperadorId ? String(mov.liquidacionOperadorId) : '',
           servicioAsociadoId: mov.servicioAsociadoId ? String(mov.servicioAsociadoId) : '',
-          banco: requiereCuentaBancaria(medioPago) ? (mov.banco || '') : '',
+          cuentaBancariaId,
+          bancoHistorico,
+          desgloseRecuperoRecalcular: false,
+          montoAplicadoViajePersistido:
+            mov.montoAplicadoViaje !== undefined && mov.montoAplicadoViaje !== null
+              ? mov.montoAplicadoViaje
+              : null,
+          montoGastosBancariosPersistido:
+            mov.montoGastosBancarios !== undefined && mov.montoGastosBancarios !== null
+              ? mov.montoGastosBancarios
+              : null,
+          porcentajeRecuperoPersistido:
+            mov.porcentajeRecupero !== undefined && mov.porcentajeRecupero !== null
+              ? mov.porcentajeRecupero
+              : null,
           pasajeroId: mov.pasajeroId && mov.pasajeroId > 0 ? String(mov.pasajeroId) : ''
         }
       };
@@ -2898,18 +3123,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   };
 
   private _getTotalesServiciosPorMoneda(servicios: IServicio[] = this.state.servicios): { usd: number; ars: number } {
-    return servicios.reduce(
-      (acc: { usd: number; ars: number }, servicio: IServicio) => {
-        const monto = Number(servicio.precioCliente) || 0;
-        if (this._normalizarMonedaServicio(servicio.moneda) === 'Dólares') {
-          acc.usd += monto;
-        } else {
-          acc.ars += monto;
-        }
-        return acc;
-      },
-      { usd: 0, ars: 0 }
-    );
+    return getTotalesServiciosPorMonedaShared(servicios);
   }
 
   /**
@@ -2917,66 +3131,35 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
    * Cotizacion se interpreta como ARS por 1 USD.
    */
   private _convertirIngresoAMonedaServicio(movimiento: IMovimiento, servicio: IServicio): number {
-    const monto = Number(movimiento.monto) || 0;
-    if (monto <= 0) {
-      return 0;
-    }
-
-    const monedaPago = this._normalizarMonedaPago(movimiento.moneda);
-    const monedaServicio = this._normalizarMonedaServicio(servicio.moneda);
-    if (monedaPago === monedaServicio) {
-      return monto;
-    }
-
-    const cotizacion = Number(movimiento.cotizacion);
-    if (!isFinite(cotizacion) || cotizacion <= 0) {
-      return 0;
-    }
-
-    if (monedaPago === 'Pesos' && monedaServicio === 'Dólares') {
-      return monto / cotizacion;
-    }
-    if (monedaPago === 'Dólares' && monedaServicio === 'Pesos') {
-      return monto * cotizacion;
-    }
-
-    return monto;
+    return convertirIngresoAMonedaServicio(
+      getMontoQueAplicaAlViaje(movimiento),
+      movimiento.moneda,
+      movimiento.cotizacion,
+      servicio.moneda
+    );
   }
 
   private _getTotalesIngresosPorMoneda(
     movimientos: IMovimiento[] = this.state.movimientos,
     servicios: IServicio[] = this.state.servicios
   ): { usd: number; ars: number } {
-    const serviciosById: { [id: number]: IServicio } = {};
-    servicios.forEach((servicio: IServicio) => {
-      serviciosById[servicio.id] = servicio;
-    });
-
-    return movimientos
-      .filter(
-        (m: IMovimiento) =>
-          isPagoConsideradoEnTotales(m) &&
-          m.tipo === 'Ingreso' &&
-          m.monto > 0 &&
-          !!m.servicioAsociadoId
-      )
-      .reduce(
-        (acc: { usd: number; ars: number }, m: IMovimiento) => {
-          const servicio = serviciosById[m.servicioAsociadoId as number];
-          if (!servicio) {
-            return acc;
-          }
-
-          const montoConvertido = this._convertirIngresoAMonedaServicio(m, servicio);
-          if (this._normalizarMonedaServicio(servicio.moneda) === 'Dólares') {
-            acc.usd += montoConvertido;
-          } else {
-            acc.ars += montoConvertido;
-          }
-          return acc;
-        },
-        { usd: 0, ars: 0 }
-      );
+    return getTotalesIngresosPorMonedaShared(
+      movimientos.map((m: IMovimiento) => ({
+        id: m.id,
+        tipoPago: m.tipo,
+        monto: m.monto,
+        montoAplicadoViaje: m.montoAplicadoViaje,
+        moneda: m.moneda,
+        cotizacion: m.cotizacion,
+        estado: m.estado,
+        servicioAsociadoId: m.servicioAsociadoId
+      })),
+      servicios.map((s: IServicio) => ({
+        id: s.id,
+        precioCliente: s.precioCliente,
+        moneda: s.moneda
+      }))
+    );
   }
 
   private _getTotalIngresosPorServicioEnMonedaServicio(servicio: IServicio, movimientoIdAExcluir?: number): number {
@@ -2985,7 +3168,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         (m: IMovimiento) =>
           isPagoConsideradoEnTotales(m) &&
           m.tipo === 'Ingreso' &&
-          m.monto > 0 &&
+          getMontoQueAplicaAlViaje(m) > 0 &&
           m.servicioAsociadoId === servicio.id &&
           (movimientoIdAExcluir === undefined || m.id !== movimientoIdAExcluir)
       )
@@ -2993,6 +3176,103 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         (acc: number, m: IMovimiento) => acc + this._convertirIngresoAMonedaServicio(m, servicio),
         0
       );
+  }
+
+  private _obtenerCuentaBancariaEditor(): ICuentaBancaria | undefined {
+    const id = Number(this.state.movimientoEnEdicion.cuentaBancariaId) || 0;
+    return findCuentaBancariaById(this.state.cuentasBancarias, id);
+  }
+
+  private _obtenerDesgloseRecuperoMovimiento(): IDesgloseRecuperoBancario {
+    const ed = this.state.movimientoEnEdicion;
+    const montoRecibido = Number(ed.monto);
+    const montoSeguro = isFinite(montoRecibido) && montoRecibido > 0 ? montoRecibido : 0;
+    const medioPago = normalizarMedioPago(ed.medioPago);
+
+    if (ed.tipo === 'Egreso') {
+      return {
+        aplicaRecupero: false,
+        porcentaje: 0,
+        montoRecibido: montoSeguro,
+        montoAplicadoViaje: montoSeguro,
+        montoGastosBancarios: 0
+      };
+    }
+
+    if (!ed.desgloseRecuperoRecalcular) {
+      const porcentaje = Number(ed.porcentajeRecuperoPersistido) || 0;
+      const aplicadoRaw = ed.montoAplicadoViajePersistido;
+      const gastosRaw = ed.montoGastosBancariosPersistido;
+      const tieneAplicado =
+        aplicadoRaw !== null && aplicadoRaw !== undefined && isFinite(Number(aplicadoRaw));
+      const tieneGastos =
+        gastosRaw !== null && gastosRaw !== undefined && isFinite(Number(gastosRaw));
+      const aplicado = tieneAplicado ? Number(aplicadoRaw) : montoSeguro;
+      const gastos = tieneGastos ? Number(gastosRaw) : 0;
+      const aplica =
+        medioPago === 'Transferencia' &&
+        montoSeguro > 0 &&
+        (gastos > 0 || (porcentaje > 0 && tieneAplicado && aplicado < montoSeguro - 0.0001));
+      return {
+        aplicaRecupero: aplica,
+        porcentaje: aplica ? porcentaje : 0,
+        montoRecibido: montoSeguro,
+        montoAplicadoViaje: aplica ? aplicado : montoSeguro,
+        montoGastosBancarios: aplica
+          ? tieneGastos
+            ? gastos
+            : Math.max(0, montoSeguro - aplicado)
+          : 0
+      };
+    }
+
+    const cuenta = this._obtenerCuentaBancariaEditor();
+    return calcularDesgloseRecuperoBancario(montoSeguro, {
+      medioPago,
+      aplicaRecupero: cuenta ? cuenta.aplicaRecupero : false,
+      porcentajeRecupero: cuenta ? cuenta.porcentajeRecupero : 0
+    });
+  }
+
+  private _renderDesgloseRecuperoMovimiento(): React.ReactNode {
+    const desglose = this._obtenerDesgloseRecuperoMovimiento();
+    if (!desglose.aplicaRecupero || desglose.montoRecibido <= 0) {
+      return null;
+    }
+    const moneda = this.state.movimientoEnEdicion.moneda || '';
+    return (
+      <div style={{ marginTop: 8, width: '100%' }}>
+        <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
+          <label style={layoutStyles.label}>Monto Aplicado Viaje</label>
+          <div style={layoutStyles.readOnlyValue}>
+            {formatMontoMoneda(desglose.montoAplicadoViaje, moneda)}
+          </div>
+        </div>
+        <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
+          <label style={layoutStyles.label}>
+            Recupero Gastos Bancarios ({formatPorcentajeRecuperoDisplay(desglose.porcentaje)}%)
+          </label>
+          <div style={layoutStyles.readOnlyValue}>
+            {formatMontoMoneda(desglose.montoGastosBancarios, moneda)}
+          </div>
+        </div>
+        <div
+          style={{
+            marginTop: 6,
+            padding: '8px 10px',
+            borderRadius: 4,
+            background: '#f3f2f1',
+            border: '1px solid #e1dfdd',
+            fontSize: 12,
+            color: '#323130'
+          }}
+        >
+          Importe recibido: {formatMontoMoneda(desglose.montoRecibido, moneda)} · Aplicado:{' '}
+          {formatMontoMoneda(desglose.montoAplicadoViaje, moneda)} · Recupero:{' '}
+          {formatMontoMoneda(desglose.montoGastosBancarios, moneda)}
+        </div>
+      </div>
+    );
   }
 
   private _renderResumenMonedas(totales: { usd: number; ars: number }): React.ReactNode {
@@ -3230,11 +3510,20 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     monto: number;
     moneda: string;
     medioPago: string;
+    cuentaBancaria?: string;
+    montoAplicadoViaje?: number | null;
+    montoGastosBancarios?: number | null;
+    porcentajeRecupero?: number | null;
+    cotizacion?: number | null;
   }): Omit<IReciboPagoGeneracionData, 'itemId'> {
     const pasajeroId = params.pasajeroId && params.pasajeroId > 0 ? params.pasajeroId : 0;
     const pasajero = pasajeroId > 0
       ? this.state.pasajeros.filter((p: IPasajero) => p.id === pasajeroId)[0]
       : undefined;
+    const cuentaBancaria = resolverCuentaBancariaParaRecibo({
+      medioPago: params.medioPago,
+      cuentaLabel: params.cuentaBancaria
+    });
     return {
       fechaPago: params.fechaPago,
       nombreApellido: pasajero
@@ -3244,8 +3533,35 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       concepto: (params.concepto || '').trim(),
       monto: Number(params.monto) || 0,
       moneda: this._normalizarMonedaPago(params.moneda),
-      formaPago: params.medioPago
+      formaPago: params.medioPago,
+      cuentaBancaria,
+      montoAplicadoViaje:
+        params.montoAplicadoViaje !== undefined ? params.montoAplicadoViaje : null,
+      montoGastosBancarios:
+        params.montoGastosBancarios !== undefined ? params.montoGastosBancarios : null,
+      porcentajeRecupero:
+        params.porcentajeRecupero !== undefined ? params.porcentajeRecupero : null,
+      cotizacion:
+        params.cotizacion !== undefined && params.cotizacion !== null && Number(params.cotizacion) > 0
+          ? Number(params.cotizacion)
+          : null
     };
+  }
+
+  private _resolverLabelCuentaBancariaParaRecibo(
+    medioPago: string,
+    cuentaBancariaId?: number | null,
+    bancoHistorico?: string
+  ): string {
+    const cuenta = findCuentaBancariaById(
+      this.state.cuentasBancarias,
+      cuentaBancariaId && cuentaBancariaId > 0 ? cuentaBancariaId : 0
+    );
+    return resolverCuentaBancariaParaRecibo({
+      medioPago,
+      cuentaLabel: cuenta ? getCuentaBancariaLabel(cuenta) : '',
+      bancoHistorico
+    });
   }
 
   private async _generarYAdjuntarReciboPago(
@@ -3374,13 +3690,26 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     }
 
     const pasajeroIdRaw = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
+    const desglose = this._obtenerDesgloseRecuperoMovimiento();
+    const cuentaEditor = this._obtenerCuentaBancariaEditor();
     const datosRecibo = this._obtenerDatosReciboDesdeMovimiento({
       pasajeroId: pasajeroIdRaw > 0 ? pasajeroIdRaw : null,
       concepto: this.state.movimientoEnEdicion.movimiento,
       fechaPago: this.state.movimientoEnEdicion.fecha,
       monto: Number(this.state.movimientoEnEdicion.monto) || 0,
       moneda: this.state.movimientoEnEdicion.moneda,
-      medioPago: normalizarMedioPago(this.state.movimientoEnEdicion.medioPago)
+      medioPago: normalizarMedioPago(this.state.movimientoEnEdicion.medioPago),
+      cuentaBancaria: resolverCuentaBancariaParaRecibo({
+        medioPago: this.state.movimientoEnEdicion.medioPago,
+        cuentaLabel: cuentaEditor ? getCuentaBancariaLabel(cuentaEditor) : '',
+        bancoHistorico: this.state.movimientoEnEdicion.bancoHistorico
+      }),
+      montoAplicadoViaje: desglose.aplicaRecupero ? desglose.montoAplicadoViaje : null,
+      montoGastosBancarios: desglose.aplicaRecupero ? desglose.montoGastosBancarios : 0,
+      porcentajeRecupero: desglose.aplicaRecupero ? desglose.porcentaje : null,
+      cotizacion: this._requiereCotizacionMovimiento()
+        ? Number(this.state.movimientoEnEdicion.cotizacion) || null
+        : null
     });
 
     try {
@@ -3451,9 +3780,15 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       movimientoOriginal ? movimientoOriginal.estado : undefined,
       esEdicion
     );
-    const banco = requiereCuentaBancaria(medioPago)
-      ? (this.state.movimientoEnEdicion.banco || '').trim()
-      : null;
+    const cuentaSeleccionada = this._obtenerCuentaBancariaEditor();
+    const cuentaBancariaId = requiereCuentaBancaria(medioPago)
+      ? cuentaSeleccionada && cuentaSeleccionada.id > 0
+        ? cuentaSeleccionada.id
+        : null
+      : esEdicion
+        ? null
+        : undefined;
+    const desglose = this._obtenerDesgloseRecuperoMovimiento();
     const motivo = resolverMotivoViaje(this.state.opcionesMotivo);
     if (!motivo) {
       this._setSectionError(
@@ -3470,10 +3805,15 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       ? this.state.pasajeros.filter((p: IPasajero) => p.id === pasajeroIdRaw)[0]
       : undefined;
     const pasajeroId =
-      pasajeroIdRaw > 0 && this._esPasajeroDelViaje(pasajeroIdRaw) ? pasajeroIdRaw : null;
-    const pasajeroNombre = pasajeroSeleccionado
-      ? pasajeroSeleccionado.nombreApellido
-      : '';
+      this.state.movimientoEnEdicion.tipo === 'Ingreso' &&
+      pasajeroIdRaw > 0 &&
+      this._esPasajeroDelViaje(pasajeroIdRaw)
+        ? pasajeroIdRaw
+        : null;
+    const pasajeroNombre =
+      this.state.movimientoEnEdicion.tipo === 'Ingreso' && pasajeroSeleccionado
+        ? pasajeroSeleccionado.nombreApellido
+        : '';
 
     const tipoPago: 'Ingreso' | 'Egreso' =
       this.state.movimientoEnEdicion.tipo === 'Egreso' ? 'Egreso' : 'Ingreso';
@@ -3517,7 +3857,10 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       cotizacion: this._requiereCotizacionMovimiento() ? (Number(this.state.movimientoEnEdicion.cotizacion) || 0) : undefined,
       liquidacionOperadorId,
       servicioAsociadoId,
-      banco,
+      cuentaBancariaId,
+      montoAplicadoViaje: desglose.montoAplicadoViaje,
+      montoGastosBancarios: desglose.montoGastosBancarios,
+      porcentajeRecupero: desglose.porcentaje,
       estado,
       motivo,
       pasajeroId,
@@ -3531,7 +3874,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       fechaPago: pagoData.fechaPago,
       monto: pagoData.monto,
       moneda: pagoData.moneda,
-      medioPago: pagoData.medioPago
+      medioPago: pagoData.medioPago,
+      cuentaBancaria: this._resolverLabelCuentaBancariaParaRecibo(
+        pagoData.medioPago,
+        pagoData.cuentaBancariaId,
+        this.state.movimientoEnEdicion.bancoHistorico
+      ),
+      montoAplicadoViaje: desglose.aplicaRecupero ? desglose.montoAplicadoViaje : null,
+      montoGastosBancarios: desglose.aplicaRecupero ? desglose.montoGastosBancarios : 0,
+      porcentajeRecupero: desglose.aplicaRecupero ? desglose.porcentaje : null,
+      cotizacion: pagoData.cotizacion
     });
 
     const nombreLiquidacion =
@@ -3558,7 +3910,14 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                 liquidacionOperadorId: pagoData.liquidacionOperadorId && pagoData.liquidacionOperadorId > 0 ? pagoData.liquidacionOperadorId : undefined,
                 servicioAsociadoId: pagoData.servicioAsociadoId && pagoData.servicioAsociadoId > 0 ? pagoData.servicioAsociadoId : undefined,
                 liquidacionOperadorNombre: nombreLiquidacion,
-                banco: banco || '',
+                cuentaBancariaId:
+                  pagoData.cuentaBancariaId && pagoData.cuentaBancariaId > 0
+                    ? pagoData.cuentaBancariaId
+                    : undefined,
+                banco: '',
+                montoAplicadoViaje: pagoData.montoAplicadoViaje,
+                montoGastosBancarios: pagoData.montoGastosBancarios,
+                porcentajeRecupero: pagoData.porcentajeRecupero,
                 estado: estado,
                 pasajeroId: pasajeroId || undefined,
                 pasajeroNombre: pasajeroNombre || ''
@@ -3601,7 +3960,14 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           liquidacionOperadorId: pagoData.liquidacionOperadorId && pagoData.liquidacionOperadorId > 0 ? pagoData.liquidacionOperadorId : undefined,
           servicioAsociadoId: created.servicioAsociadoId && created.servicioAsociadoId > 0 ? created.servicioAsociadoId : undefined,
           liquidacionOperadorNombre: nombreLiquidacion,
-          banco: banco || '',
+          cuentaBancariaId:
+            pagoData.cuentaBancariaId && pagoData.cuentaBancariaId > 0
+              ? pagoData.cuentaBancariaId
+              : undefined,
+          banco: '',
+          montoAplicadoViaje: pagoData.montoAplicadoViaje,
+          montoGastosBancarios: pagoData.montoGastosBancarios,
+          porcentajeRecupero: pagoData.porcentajeRecupero,
           estado: estado,
           pasajeroId: pasajeroId || undefined,
           pasajeroNombre: pasajeroNombre || ''
@@ -3644,7 +4010,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       camposPagoValidos = false;
     }
     if (requiereCuentaBancaria(medioPago)) {
-      if (!(this.state.movimientoEnEdicion.banco || '').trim()) {
+      const cuentaId = Number(this.state.movimientoEnEdicion.cuentaBancariaId) || 0;
+      if (this.state.cuentasBancariasError && !(cuentaId > 0)) {
+        movimientoFieldErrors.banco =
+          'No se pudieron cargar las cuentas bancarias. Reintentá o contactá al administrador.';
+        camposPagoValidos = false;
+      } else if (
+        !this.state.cuentasBancariasError &&
+        this.state.cuentasBancarias.length === 0 &&
+        !(cuentaId > 0)
+      ) {
+        movimientoFieldErrors.banco = 'No hay cuentas bancarias activas configuradas.';
+        camposPagoValidos = false;
+      } else if (!(cuentaId > 0)) {
         movimientoFieldErrors.banco =
           'La cuenta bancaria es obligatoria cuando el medio de pago es Transferencia.';
         camposPagoValidos = false;
@@ -3685,11 +4063,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         return;
       }
     } else {
-      const liquidacionesDisponiblesEgreso = this.state.liquidacionesOperador.filter(
+      const liquidacionesDelViaje = this.state.liquidacionesOperador.filter(
         (l: ILiquidacionItem) => l.id > 0 && !!(l.codigoReferencia || '').trim()
       );
       const liquidacionSeleccionadaId = Number(this.state.movimientoEnEdicion.liquidacionOperadorId);
-      if (liquidacionesDisponiblesEgreso.length === 0) {
+      if (liquidacionesDelViaje.length === 0) {
         this._setSectionError('movimientos', 'Primero debes agregar al menos una liquidación de operador para poder asociar el concepto de un egreso.');
         return;
       }
@@ -3697,9 +4075,29 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         this._setSectionError('movimientos', 'Selecciona una liquidación para asociar el concepto del egreso.');
         return;
       }
-      const liquidacionSeleccionada = liquidacionesDisponiblesEgreso.filter((l: ILiquidacionItem) => l.id === liquidacionSeleccionadaId)[0];
+      const liquidacionSeleccionada = liquidacionesDelViaje.filter((l: ILiquidacionItem) => l.id === liquidacionSeleccionadaId)[0];
       if (!liquidacionSeleccionada) {
         this._setSectionError('movimientos', 'Selecciona una liquidación válida para el egreso.');
+        return;
+      }
+      const movimientoEditadoId = this.state.movimientoEnEdicionId || undefined;
+      const cotizacionValidacion = this._requiereCotizacionMovimiento()
+        ? Number(this.state.movimientoEnEdicion.cotizacion)
+        : undefined;
+      if (
+        montoExcedeSaldoPendienteLiquidacion(
+          this._mapLiquidacionOperador(liquidacionSeleccionada),
+          this._getPagosSaldoDesdeMovimientos(),
+          Number(this.state.movimientoEnEdicion.monto) || 0,
+          this._normalizarMonedaPago(this.state.movimientoEnEdicion.moneda),
+          cotizacionValidacion,
+          movimientoEditadoId
+        )
+      ) {
+        this._setSectionError(
+          'movimientos',
+          'El importe del egreso no puede superar el saldo pendiente de la liquidación.'
+        );
         return;
       }
     }
@@ -3722,6 +4120,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     if (esIngreso && servicioSeleccionadoIngreso) {
       const movimientoEditadoId = this.state.movimientoEnEdicionId || undefined;
       const totalYaIngresado = this._getTotalIngresosPorServicioEnMonedaServicio(servicioSeleccionadoIngreso, movimientoEditadoId);
+      const desglose = this._obtenerDesgloseRecuperoMovimiento();
       const ingresoActual: IMovimiento = {
         id: movimientoEditadoId || 0,
         movimiento: this.state.movimientoEnEdicion.movimiento,
@@ -3729,6 +4128,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         fecha: this.state.movimientoEnEdicion.fecha,
         moneda: this._normalizarMonedaPago(this.state.movimientoEnEdicion.moneda),
         monto: Number(this.state.movimientoEnEdicion.monto) || 0,
+        montoAplicadoViaje: desglose.montoAplicadoViaje,
         observaciones: this.state.movimientoEnEdicion.observaciones,
         cotizacion: this._requiereCotizacionMovimiento() ? (Number(this.state.movimientoEnEdicion.cotizacion) || 0) : undefined,
         tipo: 'Ingreso',
@@ -3737,7 +4137,12 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       const ingresoActualConvertido = this._convertirIngresoAMonedaServicio(ingresoActual, servicioSeleccionadoIngreso);
       const presupuestoServicio = Number(servicioSeleccionadoIngreso.precioCliente) || 0;
       if (totalYaIngresado + ingresoActualConvertido > presupuestoServicio) {
-        this._setSectionError('movimientos', 'El monto ingresado supera el servicio presupuestado.');
+        this._setSectionError(
+          'movimientos',
+          desglose.aplicaRecupero
+            ? 'El importe aplicado al viaje supera el servicio presupuestado.'
+            : 'El monto ingresado supera el servicio presupuestado.'
+        );
         return;
       }
     }
@@ -3798,7 +4203,6 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   };
 
   private _aprobarMovimiento = async (id: number): Promise<void> => {
-    if (this._esSoloLectura()) { return; }
     const movimiento = this.state.movimientos.filter((m: IMovimiento) => m.id === id)[0];
     if (!movimiento || !isMovimientoPendiente(movimiento)) {
       return;
@@ -3845,7 +4249,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           fechaPago: movimiento.fecha,
           monto: movimiento.monto,
           moneda: movimiento.moneda,
-          medioPago: movimiento.medioPago
+          medioPago: movimiento.medioPago,
+          cuentaBancaria: this._resolverLabelCuentaBancariaParaRecibo(
+            movimiento.medioPago,
+            movimiento.cuentaBancariaId,
+            movimiento.banco
+          ),
+          montoAplicadoViaje: movimiento.montoAplicadoViaje,
+          montoGastosBancarios: movimiento.montoGastosBancarios,
+          porcentajeRecupero: movimiento.porcentajeRecupero,
+          cotizacion: movimiento.cotizacion
         });
         const reciboOk = await this._generarYAdjuntarReciboPago(id, datosRecibo);
         if (!reciboOk) {
@@ -3887,6 +4300,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       if (this.state.presupuestoArchivoPendiente) {
         await this._service.uploadPresupuesto(creado.id, this.state.presupuestoArchivoPendiente);
       }
+      if (this._navegarAFormularioEdicion(creado.id)) {
+        return;
+      }
       this.props.onSave();
     } catch (error) {
       this.setState({ error: 'No se pudo guardar el viaje en "Registro de Viajes". Verifica lookup IDs.' });
@@ -3919,9 +4335,10 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     const serviciosDisponiblesIngreso = this.state.servicios.filter(
       (servicio: IServicio) => servicio.id > 0 && !!(servicio.concepto || '').trim()
     );
-    const liquidacionesDisponiblesEgreso = this.state.liquidacionesOperador.filter(
+    const liquidacionesDisponiblesEgreso = this._getLiquidacionesEgresoParaSelector();
+    const hayLiquidacionesCargadas = this.state.liquidacionesOperador.filter(
       (l: ILiquidacionItem) => l.id > 0 && !!(l.codigoReferencia || '').trim()
-    );
+    ).length > 0;
     const pasajerosDelViaje = this._getPasajerosDelViaje();
     const pasajeroEditorId = Number(this.state.movimientoEnEdicion.pasajeroId) || 0;
     const pasajeroEditorHuerfano =
@@ -4975,11 +5392,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                                 <GridIconDownload />
                               </GridIconActionButton>
                             )}
-                            {!soloLectura && this.state.movimientoEstadoView === 'pendientes' && (
+                            {this.state.movimientoEstadoView === 'pendientes' && (
                               <GridIconActionButton
                                 title="Aprobar"
                                 onClick={() => { void this._aprobarMovimiento(m.id); }}
-                                disabled={!pagosHabilitados || this.state.guardando}
+                                disabled={!this.state.viajeId || this.state.guardando}
                               >
                                 <GridIconCheck />
                               </GridIconActionButton>
@@ -5025,7 +5442,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                     </select>
                   </div>
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
-                    <label style={layoutStyles.label}>Concepto</label>
+                    <label style={layoutStyles.label}>
+                      {this.state.movimientoEnEdicion.tipo === 'Ingreso'
+                        ? 'Concepto'
+                        : 'Liquidación de Operador'}
+                    </label>
                     {this.state.movimientoEnEdicion.tipo === 'Ingreso' ? (
                       <select
                         style={movimientosStyles.select}
@@ -5048,9 +5469,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                         disabled={this.state.guardando || liquidacionesDisponiblesEgreso.length === 0}
                       >
                         <option value="">Seleccione...</option>
-                        {liquidacionesDisponiblesEgreso.map((l: ILiquidacionItem) => (
+                        {liquidacionesDisponiblesEgreso.map((l: ILiquidacionOperador) => (
                           <option key={l.id} value={String(l.id)}>
-                            {l.codigoReferencia}
+                            {formatLiquidacionOperadorLabel(l)}
                           </option>
                         ))}
                       </select>
@@ -5060,17 +5481,24 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                         Primero debes agregar un servicio para poder asociar el concepto del ingreso.
                       </div>
                     )}
-                    {this.state.movimientoEnEdicion.tipo === 'Egreso' && liquidacionesDisponiblesEgreso.length === 0 && (
+                    {this.state.movimientoEnEdicion.tipo === 'Egreso' &&
+                      !hayLiquidacionesCargadas && (
                       <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
                         Primero debes agregar una liquidación de operador para poder asociar el concepto del egreso.
                       </div>
                     )}
+                    {this.state.movimientoEnEdicion.tipo === 'Egreso' &&
+                      hayLiquidacionesCargadas &&
+                      liquidacionesDisponiblesEgreso.length === 0 && (
+                      <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
+                        No hay liquidaciones de operadores disponibles para este viaje.
+                      </div>
+                    )}
+                    {this._renderSaldoPendienteLiquidacionMovimiento()}
                   </div>
+                  {this.state.movimientoEnEdicion.tipo === 'Ingreso' && (
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
-                    <label style={layoutStyles.label}>
-                      Pasajero
-                      {this.state.movimientoEnEdicion.tipo === 'Ingreso' ? '' : ' (opcional)'}
-                    </label>
+                    <label style={layoutStyles.label}>Pasajero</label>
                     <select
                       style={movimientosStyles.select}
                       value={this.state.movimientoEnEdicion.pasajeroId}
@@ -5106,6 +5534,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                       </div>
                     )}
                   </div>
+                  )}
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Medio de pago</label>
                     <select
@@ -5132,31 +5561,49 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                       <label style={layoutStyles.label}>Cuenta Bancaria</label>
                       <select
                         style={movimientosStyles.select}
-                        value={this.state.movimientoEnEdicion.banco}
-                        onChange={e => this._onCambiarBancoMovimiento(e.target.value)}
+                        value={
+                          this.state.movimientoEnEdicion.cuentaBancariaId
+                            ? this.state.movimientoEnEdicion.cuentaBancariaId
+                            : this.state.movimientoEnEdicion.bancoHistorico
+                              ? 'legacy'
+                              : ''
+                        }
+                        onChange={e => this._onCambiarCuentaBancariaMovimiento(e.target.value)}
                         disabled={
                           this.state.guardando ||
-                          this.state.opcionesBancoCargando ||
-                          this.state.opcionesBanco.length === 0
+                          this.state.cuentasBancariasCargando
                         }
                       >
                         <option value="">Seleccione...</option>
-                        {this.state.opcionesBanco.map((opcion: string) => (
-                          <option key={opcion} value={opcion}>
-                            {opcion}
+                        {this.state.cuentasBancarias.map((cuenta: ICuentaBancaria) => (
+                          <option key={cuenta.id} value={cuenta.id}>
+                            {getCuentaBancariaLabel(cuenta)}
                           </option>
                         ))}
+                        {!this.state.movimientoEnEdicion.cuentaBancariaId &&
+                          !!this.state.movimientoEnEdicion.bancoHistorico && (
+                            <option value="legacy">
+                              {this.state.movimientoEnEdicion.bancoHistorico}
+                            </option>
+                          )}
                       </select>
-                      {this.state.opcionesBancoCargando && (
+                      {this.state.cuentasBancariasCargando && (
                         <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
                           Cargando cuentas bancarias...
                         </div>
                       )}
-                      {this.state.opcionesBancoError && (
+                      {this.state.cuentasBancariasError && (
                         <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
-                          {this.state.opcionesBancoError}
+                          {this.state.cuentasBancariasError}
                         </div>
                       )}
+                      {!this.state.cuentasBancariasError &&
+                        !this.state.cuentasBancariasCargando &&
+                        this.state.cuentasBancarias.length === 0 && (
+                          <div style={{ ...layoutStyles.info, marginBottom: 0, marginTop: 6 }}>
+                            No hay cuentas bancarias activas configuradas.
+                          </div>
+                        )}
                       {this.state.movimientoFieldErrors.banco && (
                         <div style={{ ...layoutStyles.error, marginBottom: 0, marginTop: 6 }}>
                           {this.state.movimientoFieldErrors.banco}
@@ -5194,6 +5641,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                   <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
                     <label style={layoutStyles.label}>Monto</label>
                     <input type="number" style={movimientosStyles.input} value={this.state.movimientoEnEdicion.monto} onChange={e => this._actualizarCampoMovimiento('monto', e.target.value)} disabled={this.state.guardando} />
+                    {this._renderDesgloseRecuperoMovimiento()}
                   </div>
                   {requiereCotizacionMovimiento && (
                     <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
@@ -5460,7 +5908,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
               <button
                 type="button"
                 style={layoutStyles.primaryButton}
-                onClick={this._navegarAFormularioEdicion}
+                onClick={() => { this._navegarAFormularioEdicion(); }}
                 disabled={this.state.guardando || !this._getItemId()}
               >
                 Editar

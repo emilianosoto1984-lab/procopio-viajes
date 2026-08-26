@@ -17,11 +17,20 @@
           "manifest": "./src/extensions/registroPagosForm/RegistroPagosFormFormCustomizer.manifest.json"
         }
       ]
+    },
+    "vista-caja-consolidada-web-part": {
+      "components": [
+        {
+          "entrypoint": "./lib/webparts/vistaCajaConsolidada/VistaCajaConsolidadaWebPart.js",
+          "manifest": "./src/webparts/vistaCajaConsolidada/VistaCajaConsolidadaWebPart.manifest.json"
+        }
+      ]
     }
   },
   "externals": {},
   "localizedResources": {
     "ProcopioFormsFormCustomizerStrings": "lib/extensions/procopioForms/loc/{locale}.js",
-    "RegistroPagosFormFormCustomizerStrings": "lib/extensions/registroPagosForm/loc/{locale}.js"
+    "RegistroPagosFormFormCustomizerStrings": "lib/extensions/registroPagosForm/loc/{locale}.js",
+    "VistaCajaConsolidadaWebPartStrings": "lib/webparts/vistaCajaConsolidada/loc/{locale}.js"
   }
 }
