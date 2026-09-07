@@ -25,7 +25,6 @@ export default class CajaConsolidadaGrid extends React.Component<ICajaConsolidad
               <th className={styles.th}>Recuperos bancarios</th>
               <th className={styles.th}>Total recibido</th>
               <th className={styles.th}>Saldo pendiente</th>
-              <th className={styles.th}>Resultado viaje</th>
             </tr>
           </thead>
           <tbody>
@@ -52,9 +51,6 @@ export default class CajaConsolidadaGrid extends React.Component<ICajaConsolidad
                 </td>
                 <td className={styles.td}>
                   <ImporteMoneda importes={item.saldoPendiente} stacked={true} />
-                </td>
-                <td className={styles.td}>
-                  <ImporteMoneda importes={item.resultadoViaje} stacked={true} />
                 </td>
               </tr>
             ))}

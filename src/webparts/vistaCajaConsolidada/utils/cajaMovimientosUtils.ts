@@ -28,12 +28,15 @@ export interface IPagoParaCaja {
   estado?: string;
   servicioAsociadoId?: number;
   concepto?: string;
+  motivo?: string;
   cuentaBancariaId?: number | null;
   cuentaBancariaTitulo?: string;
   banco?: string;
   fechaPago?: string;
   medioPago?: string;
   observaciones?: string;
+  /** Título del lookup ViajeAsociado (solo presentación). */
+  viajeTitulo?: string;
 }
 
 export interface IMovimientoCajaLinea {
@@ -52,12 +55,13 @@ export interface IMovimientoCajaLinea {
   cuentaBancariaId?: number | null;
   cuentaBancariaLabel: string;
   medioPago?: string;
+  viajeTitulo?: string;
 }
 
 export interface IEgresoSinViajeCaja {
   id: number;
   fechaPago: string;
-  concepto: string;
+  motivo: string;
   medioPago: string;
   cuentaBancariaLabel: string;
   moneda: string;
@@ -137,9 +141,9 @@ function _conceptoPrincipal(pago: IPagoParaCaja): string {
   return concepto || 'Pago';
 }
 
-function _conceptoEgresoSinViaje(pago: IPagoParaCaja): string {
-  const concepto = (pago.concepto || '').trim();
-  return concepto || 'Egreso sin concepto';
+function _motivoEgresoSinViaje(pago: IPagoParaCaja): string {
+  const motivo = (pago.motivo || '').trim();
+  return motivo || 'Sin motivo';
 }
 
 /**
@@ -219,7 +223,7 @@ export function listarEgresosSinViaje(pagos: IPagoParaCaja[]): IEgresoSinViajeCa
     .map((pago: IPagoParaCaja) => ({
       id: pago.id,
       fechaPago: pago.fechaPago || '',
-      concepto: _conceptoEgresoSinViaje(pago),
+      motivo: _motivoEgresoSinViaje(pago),
       medioPago: (pago.medioPago || '').trim(),
       cuentaBancariaLabel: resolverCuentaBancariaLabelCaja(pago) || '—',
       moneda: pago.moneda || '',
@@ -355,4 +359,76 @@ export function createEmptyTotalesGeneralesCaja(): ITotalesGeneralesCaja {
     totalEgresos: createEmptyImportesMoneda(),
     resultadoGeneral: createEmptyImportesMoneda()
   };
+}
+
+export interface ITotalesMovimientosCaja {
+  ingresos: IImportesMoneda;
+  egresos: IImportesMoneda;
+  saldo: IImportesMoneda;
+  cantidad: number;
+}
+
+/**
+ * Totales de la vista Movimientos a partir de las líneas visibles.
+ * Sobre una colección vacía devuelve ceros.
+ */
+export function calcularTotalesMovimientosCaja(
+  lineas: IMovimientoCajaLinea[]
+): ITotalesMovimientosCaja {
+  const ingresos = createEmptyImportesMoneda();
+  const egresos = createEmptyImportesMoneda();
+  (lineas || []).forEach((linea: IMovimientoCajaLinea) => {
+    if ((linea.tipoPago || '').trim() === 'Egreso') {
+      _acumularPorMonedaPago(egresos, linea.moneda, linea.monto);
+    } else {
+      _acumularPorMonedaPago(ingresos, linea.moneda, linea.monto);
+    }
+  });
+  return {
+    ingresos,
+    egresos,
+    saldo: _restarImportes(ingresos, egresos),
+    cantidad: (lineas || []).length
+  };
+}
+
+/**
+ * Una fila de la vista Movimientos por cada Registro de Pago (ingreso o egreso).
+ * No usa el split de recupero: el importe es el Monto del ítem.
+ */
+export function mapearPagosALineasMovimientosCaja(
+  pagos: IPagoParaCaja[]
+): IMovimientoCajaLinea[] {
+  return (pagos || [])
+    .filter((pago: IPagoParaCaja) => pago.id > 0)
+    .map((pago: IPagoParaCaja) => {
+      const tipoPago = (pago.tipoPago || '').trim() === 'Egreso' ? 'Egreso' : 'Ingreso';
+      const concepto = (pago.concepto || '').trim() || 'Pago';
+      return {
+        key: String(pago.id),
+        tipoLinea: 'principal' as TipoLineaCaja,
+        pagoId: pago.id,
+        viajeId: pago.viajeId && pago.viajeId > 0 ? pago.viajeId : 0,
+        servicioAsociadoId: pago.servicioAsociadoId,
+        fechaPago: pago.fechaPago || '',
+        tipoPago,
+        concepto,
+        monto: Number(pago.monto) || 0,
+        moneda: pago.moneda,
+        cotizacion: pago.cotizacion,
+        estado: pago.estado,
+        cuentaBancariaId: pago.cuentaBancariaId,
+        cuentaBancariaLabel: resolverCuentaBancariaLabelCaja(pago),
+        medioPago: pago.medioPago,
+        viajeTitulo: (pago.viajeTitulo || '').trim()
+      };
+    })
+    .sort((a: IMovimientoCajaLinea, b: IMovimientoCajaLinea) => {
+      const fa = a.fechaPago || '';
+      const fb = b.fechaPago || '';
+      if (fa === fb) {
+        return b.pagoId - a.pagoId;
+      }
+      return fa < fb ? 1 : -1;
+    });
 }

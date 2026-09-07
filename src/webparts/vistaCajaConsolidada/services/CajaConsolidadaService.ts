@@ -8,6 +8,13 @@ import {
   resolveRegistroPagoFieldMap
 } from '../../../shared/registroPagoFieldMap';
 import { mapSharePointItemToRegistroPago } from '../../../shared/registroPagoPayload';
+import {
+  buildCuentasBancariasSelectFields,
+  ICuentaBancaria,
+  ICuentasBancariasFieldMap,
+  mapSharePointItemToCuentaBancaria,
+  resolveCuentasBancariasFieldMap
+} from '../../../shared/cuentasBancariasUtils';
 import { toDateInput } from '../../../shared/sharePointDateUtils';
 import {
   getSaldosPendientesPorMoneda,
@@ -19,20 +26,25 @@ import { ICajaConsolidadaVistaData } from '../models/ICajaConsolidadaVistaData';
 import { IFiltrosCajaConsolidada } from '../models/IFiltrosCajaConsolidada';
 import { IImportesMoneda } from '../models/IImportesMoneda';
 import { isSaldoPendienteEnCero, resolveEstadoCajaFinanciero, tieneImporteMoneda } from '../utils/cajaConsolidadaUtils';
+import { OrigenCaja } from '../models/OrigenCaja';
 import {
   calcularTotalesGeneralesCaja,
+  IMovimientoCajaLinea,
   IPagoParaCaja,
   listarEgresosSinViaje,
+  mapearPagosALineasMovimientosCaja,
   sumEgresosAsociadosPorMonedaPago,
   sumTotalRecibidoPorMonedaPago,
   sumTotalRecuperoPorMonedaPago
 } from '../utils/cajaMovimientosUtils';
+import { filtrarPagosPorOrigenCaja } from '../utils/origenCajaUtils';
 import { createEmptyImportesMoneda } from '../utils/monedaUtils';
 import { ICajaConsolidadaService } from './ICajaConsolidadaService';
 
 const LISTA_VIAJES = 'Registro de Viajes';
 const LISTA_PAGOS = 'Registro de Pagos';
 const LISTA_SERVICIOS_VIAJE = 'ServiciosViaje';
+const LISTA_CUENTAS_BANCARIAS = 'CuentasBancarias';
 
 interface IViajeCajaRow {
   id: number;
@@ -62,6 +74,9 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
   private _registroPagoFieldMap: IRegistroPagoFieldMap | undefined;
   private _viajesFieldMap: IStringMap | undefined;
   private _serviciosFieldMap: IStringMap | undefined;
+  private _cuentasBancariasFieldMap: ICuentasBancariasFieldMap | undefined;
+  private _pagosMovimientosCache: IPagoCajaRow[] | undefined;
+  private _listaPagosGuid: string | undefined;
 
   public constructor(context: WebPartContext) {
     this._spHttpClient = context.spHttpClient;
@@ -157,6 +172,132 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
       totalEgresosAsociadosViajes: this._sumCampoItems(items, 'egresosAsociados'),
       totalSaldoPendienteCobro: this._sumCampoItems(items, 'saldoPendiente')
     };
+  }
+
+  /**
+   * Cuentas activas de CuentasBancarias. No consulta Registro de Pagos.
+   */
+  public async getCuentasBancarias(): Promise<ICuentaBancaria[]> {
+    const map = await this._getCuentasBancariasFieldMap();
+    const selectFields = buildCuentasBancariasSelectFields(map);
+    const baseUrl =
+      this._webUrl +
+      "/_api/web/lists/getByTitle('" +
+      LISTA_CUENTAS_BANCARIAS +
+      "')/items?$select=" +
+      encodeURIComponent(selectFields.join(',')) +
+      '&$orderby=Title&$top=5000';
+
+    let json: any;
+    if (map.Activo) {
+      const filteredUrl = baseUrl + '&$filter=' + encodeURIComponent(map.Activo + ' eq 1');
+      try {
+        json = await this._get(filteredUrl);
+      } catch (error) {
+        console.warn(
+          '[CuentasBancarias] Filtro OData Activo eq 1 falló; se reintenta sin filtro.',
+          error
+        );
+        json = await this._get(baseUrl);
+      }
+    } else {
+      json = await this._get(baseUrl);
+    }
+
+    const values = this._getResults(json);
+    const cuentas = values.map((item: any) => mapSharePointItemToCuentaBancaria(item, map));
+    if (map.Activo) {
+      return cuentas.filter((cuenta: ICuentaBancaria) => cuenta.activo);
+    }
+    return cuentas;
+  }
+
+  /**
+   * Lee Registro de Pagos (field map en runtime) y filtra por origen.
+   * Efectivo: MedioPago = Efectivo. Banco: CuentaBancaria.Id.
+   */
+  public async getMovimientos(origen: OrigenCaja): Promise<IMovimientoCajaLinea[]> {
+    const pagos = await this._getPagosParaMovimientos();
+    const filtrados = filtrarPagosPorOrigenCaja(pagos, origen);
+    return mapearPagosALineasMovimientosCaja(filtrados);
+  }
+
+  /**
+   * URL del formulario Display de un ítem de Registro de Pagos
+   * (PageType=4 = Display; no Edit).
+   */
+  public async getPagoDisplayFormUrl(pagoId: number): Promise<string> {
+    if (!pagoId || pagoId <= 0) {
+      throw new Error('El Id del pago es inválido.');
+    }
+    const listGuid = await this._getListaPagosGuid();
+    return (
+      this._webUrl +
+      '/_layouts/15/listform.aspx?PageType=4&ListId=' +
+      encodeURIComponent(listGuid) +
+      '&ID=' +
+      pagoId
+    );
+  }
+
+  private async _getListaPagosGuid(): Promise<string> {
+    if (this._listaPagosGuid) {
+      return this._listaPagosGuid;
+    }
+    const url =
+      this._webUrl +
+      "/_api/web/lists/getByTitle('" +
+      LISTA_PAGOS +
+      "')?$select=Id";
+    const json: any = await this._get(url);
+    const guid = this._getString(json, 'Id');
+    if (!guid) {
+      throw new Error('No se pudo obtener el Id de la lista Registro de Pagos.');
+    }
+    this._listaPagosGuid = guid;
+    return guid;
+  }
+
+  /**
+   * Actualiza únicamente Estado = Aprobado (misma regla que Registro de Viajes).
+   */
+  public async aprobarPago(pagoId: number): Promise<void> {
+    if (!pagoId || pagoId <= 0) {
+      throw new Error('El Id del pago es inválido.');
+    }
+    const map = await this._getPagosFieldMap();
+    if (!map.fieldExists.Estado) {
+      throw new Error('La columna Estado no existe en la lista Registro de Pagos.');
+    }
+    const payload: { [key: string]: string } = {};
+    payload[map.Estado] = 'Aprobado';
+    const url =
+      this._webUrl +
+      "/_api/web/lists/getByTitle('" +
+      LISTA_PAGOS +
+      "')/items(" +
+      pagoId +
+      ')';
+    await this._post(url, payload, {
+      'X-HTTP-Method': 'MERGE',
+      'IF-MATCH': '*'
+    });
+    if (this._pagosMovimientosCache) {
+      this._pagosMovimientosCache = this._pagosMovimientosCache.map((pago: IPagoCajaRow) => {
+        if (pago.id !== pagoId) {
+          return pago;
+        }
+        return { ...pago, estado: 'Aprobado' };
+      });
+    }
+  }
+
+  private async _getPagosParaMovimientos(): Promise<IPagoCajaRow[]> {
+    if (this._pagosMovimientosCache) {
+      return this._pagosMovimientosCache;
+    }
+    this._pagosMovimientosCache = await this._getPagos();
+    return this._pagosMovimientosCache;
   }
 
   private _sumCampoItems(
@@ -358,12 +499,14 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
           estado: shared.estado,
           servicioAsociadoId: shared.servicioViajeId,
           concepto: shared.concepto,
+          motivo: shared.motivo,
           cuentaBancariaId: shared.cuentaBancariaId,
           cuentaBancariaTitulo: shared.cuentaBancariaTitulo,
           banco: shared.banco,
           fechaPago: shared.fechaPago,
           medioPago: shared.medioPago,
-          observaciones: shared.observaciones
+          observaciones: shared.observaciones,
+          viajeTitulo: this._getLookupTitle(item, map.ViajeAsociado)
         } as IPagoCajaRow;
       })
       .filter((pago: IPagoCajaRow) => pago.id > 0);
@@ -418,6 +561,21 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
     const fields: ISharePointListFieldMeta[] = this._getResults(json);
     this._registroPagoFieldMap = resolveRegistroPagoFieldMap(fields, { log: false });
     return this._registroPagoFieldMap;
+  }
+
+  private async _getCuentasBancariasFieldMap(): Promise<ICuentasBancariasFieldMap> {
+    if (this._cuentasBancariasFieldMap) {
+      return this._cuentasBancariasFieldMap;
+    }
+    const url =
+      this._webUrl +
+      "/_api/web/lists/getByTitle('" +
+      LISTA_CUENTAS_BANCARIAS +
+      "')/fields?$select=Title,InternalName,TypeAsString,Hidden";
+    const json: any = await this._get(url);
+    const fields: ISharePointListFieldMeta[] = this._getResults(json);
+    this._cuentasBancariasFieldMap = resolveCuentasBancariasFieldMap(fields);
+    return this._cuentasBancariasFieldMap;
   }
 
   private async _getViajesFieldMap(): Promise<IStringMap> {
@@ -482,6 +640,13 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
     return 0;
   }
 
+  private _getLookupTitle(item: any, fieldName: string): string {
+    if (!fieldName || !item || !item[fieldName]) {
+      return '';
+    }
+    return this._getString(item[fieldName], 'Title');
+  }
+
   private _getString(source: any, key: string): string {
     if (!key || !source) {
       return '';
@@ -522,5 +687,32 @@ export default class CajaConsolidadaService implements ICajaConsolidadaService {
       throw new Error('Error HTTP ' + response.status + ' al consultar SharePoint.');
     }
     return response.json();
+  }
+
+  private async _post(
+    url: string,
+    body?: { [key: string]: any },
+    extraHeaders?: { [key: string]: string }
+  ): Promise<void> {
+    const headers: { [key: string]: string } = {
+      Accept: 'application/json;odata.metadata=minimal',
+      'Content-Type': 'application/json;odata.metadata=minimal'
+    };
+    if (extraHeaders) {
+      Object.keys(extraHeaders).forEach((key: string) => {
+        headers[key] = extraHeaders[key];
+      });
+    }
+    const response: SPHttpClientResponse = await this._spHttpClient.post(
+      url,
+      SPHttpClient.configurations.v1,
+      {
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined
+      }
+    );
+    if (!response.ok) {
+      throw new Error('Error HTTP ' + response.status + ' al actualizar SharePoint.');
+    }
   }
 }

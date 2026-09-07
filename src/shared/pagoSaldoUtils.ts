@@ -25,12 +25,28 @@ export interface IServicioSaldoItem {
   moneda: string;
 }
 
+export function normalizarEstadoPago(estado?: string): string {
+  return (estado || '').trim().toLowerCase();
+}
+
+export function esPagoAprobado(pago: { estado?: string }): boolean {
+  return normalizarEstadoPago(pago.estado) === 'aprobado';
+}
+
+export function esPagoPendiente(pago: { estado?: string }): boolean {
+  return normalizarEstadoPago(pago.estado) === 'pendiente';
+}
+
+export function esPagoSinEstado(pago: { estado?: string }): boolean {
+  return normalizarEstadoPago(pago.estado) === '';
+}
+
 /**
  * Solo pagos Aprobados (y históricos sin Estado) impactan saldos/totales.
  * Misma regla que Registro de Viajes.
  */
 export function isPagoConsideradoEnTotales(pago: { estado?: string }): boolean {
-  const estado = (pago.estado || '').trim().toLowerCase();
+  const estado = normalizarEstadoPago(pago.estado);
   return estado === '' || estado === 'aprobado';
 }
 
