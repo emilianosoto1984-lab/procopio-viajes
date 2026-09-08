@@ -4,6 +4,7 @@ import { FormCustomizerContext } from '@microsoft/sp-listview-extensibility';
 import SharePointViajesService, {
   IDestinoGeneralItem,
   IDestinoItem,
+  ILiquidacionAttachment,
   ILiquidacionData,
   ILiquidacionItem,
   IOperadorItem,
@@ -160,8 +161,11 @@ interface IProcopioFormsState {
     operadorId: string;
     monto: string;
     moneda: MonedaLiquidacion;
-    archivoFile: File | null;
+    /** Archivos nuevos pendientes de subir (solo en alta; en edición se suben al seleccionar). */
+    archivosPendientes: File[];
   };
+  liquidacionArchivosExistentes: ILiquidacionAttachment[];
+  liquidacionArchivosSubiendo: boolean;
   liquidacionEnEdicionId: number | null;
   cargando: boolean;
   guardando: boolean;
@@ -923,7 +927,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       presupuestoSubiendo: false,
       presupuestoArchivoPendiente: null,
       mostrarEditorLiquidacion: false,
-      liquidacionEnEdicion: { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivoFile: null },
+      liquidacionEnEdicion: { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivosPendientes: [] },
+      liquidacionArchivosExistentes: [],
+      liquidacionArchivosSubiendo: false,
       liquidacionEnEdicionId: null,
       cargando: true,
       guardando: false,
@@ -1049,19 +1055,35 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     return parsed > 0 ? parsed : null;
   }
 
-  private _navegarAFormularioEdicion = (): void => {
-    const itemId = this._getItemId();
+  private _navegarAFormularioEdicion = (itemIdOverride?: number): void => {
+    const itemId = itemIdOverride && itemIdOverride > 0 ? itemIdOverride : this._getItemId();
     const listGuid = this.props.context.list?.guid?.toString();
     if (!itemId || !listGuid) {
       return;
     }
     const webUrl = this.props.context.pageContext.web.absoluteUrl.replace(/\/$/, '');
-    const url =
+    let url =
       webUrl +
       '/_layouts/15/listform.aspx?PageType=6&ListId=' +
       encodeURIComponent(listGuid) +
       '&ID=' +
       itemId;
+
+    // Conserva parámetros de debug SPFx si el form se abrió en modo local.
+    try {
+      const current = new URL(window.location.href);
+      const debugKeys = ['debugManifestsFile', 'loadSPFX', 'componentId'];
+      for (let i = 0; i < debugKeys.length; i++) {
+        const key = debugKeys[i];
+        const value = current.searchParams.get(key);
+        if (value) {
+          url += '&' + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+        }
+      }
+    } catch (error) {
+      // Ignorar si la URL actual no es parseable.
+    }
+
     window.location.assign(url);
   };
 
@@ -2420,6 +2442,16 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     }
   };
 
+  private _estadoEditorLiquidacionVacio(): {
+    codigoReferencia: string;
+    operadorId: string;
+    monto: string;
+    moneda: MonedaLiquidacion;
+    archivosPendientes: File[];
+  } {
+    return { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivosPendientes: [] };
+  }
+
   private _abrirLiquidacionArchivo = (url: string): void => {
     if (!url) { return; }
     window.open(url, '_blank');
@@ -2431,29 +2463,51 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     this.setState({
       mostrarEditorLiquidacion: true,
       liquidacionEnEdicionId: null,
-      liquidacionEnEdicion: { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivoFile: null }
+      liquidacionArchivosExistentes: [],
+      liquidacionArchivosSubiendo: false,
+      liquidacionEnEdicion: this._estadoEditorLiquidacionVacio()
     });
   };
 
   private _editarLiquidacion = (id: number): void => {
     if (this._esSoloLectura()) { return; }
-    this.setState(prev => {
-      const liquidacion = prev.liquidacionesOperador.filter((l: ILiquidacionItem) => l.id === id)[0];
-      if (!liquidacion) { return prev; }
-      return {
-        ...prev,
-        mostrarEditorLiquidacion: true,
-        liquidacionEnEdicionId: id,
-        liquidacionEnEdicion: {
-          codigoReferencia: liquidacion.codigoReferencia,
-          operadorId: liquidacion.operadorId ? String(liquidacion.operadorId) : '',
-          monto: String(liquidacion.monto),
-          moneda: this._normalizarMonedaLiquidacion(liquidacion.moneda),
-          archivoFile: null
-        }
-      };
+    const liquidacion = this.state.liquidacionesOperador.filter((l: ILiquidacionItem) => l.id === id)[0];
+    if (!liquidacion) { return; }
+
+    const archivosIniciales = liquidacion.archivos && liquidacion.archivos.length > 0
+      ? liquidacion.archivos.slice()
+      : (liquidacion.archivoNombre && liquidacion.archivoUrl
+        ? [{ fileName: liquidacion.archivoNombre, serverRelativeUrl: liquidacion.archivoUrl }]
+        : []);
+
+    this.setState({
+      mostrarEditorLiquidacion: true,
+      liquidacionEnEdicionId: id,
+      liquidacionArchivosExistentes: archivosIniciales,
+      liquidacionArchivosSubiendo: false,
+      liquidacionEnEdicion: {
+        codigoReferencia: liquidacion.codigoReferencia,
+        operadorId: liquidacion.operadorId ? String(liquidacion.operadorId) : '',
+        monto: String(liquidacion.monto),
+        moneda: this._normalizarMonedaLiquidacion(liquidacion.moneda),
+        archivosPendientes: []
+      }
+    }, () => {
+      void this._refrescarArchivosLiquidacionEnEdicion(id);
     });
   };
+
+  private async _refrescarArchivosLiquidacionEnEdicion(itemId: number): Promise<void> {
+    try {
+      const archivos = await this._service.getLiquidacionAttachments(itemId);
+      if (this.state.liquidacionEnEdicionId !== itemId) {
+        return;
+      }
+      this.setState({ liquidacionArchivosExistentes: archivos });
+    } catch (error) {
+      // Si falla el refresh, se mantienen los archivos ya cargados en estado.
+    }
+  }
 
   private _actualizarCampoLiquidacion = (campo: 'codigoReferencia' | 'operadorId' | 'monto' | 'moneda', valor: string): void => {
     const valorNormalizado = campo === 'moneda' ? this._normalizarMonedaLiquidacion(valor) : valor;
@@ -2467,8 +2521,96 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   };
 
   private _onArchivoLiquidacionChange = (ev: React.ChangeEvent<HTMLInputElement>): void => {
-    const file = ev.target.files && ev.target.files.length > 0 ? ev.target.files[0] : null;
-    this.setState(prev => ({ liquidacionEnEdicion: { ...prev.liquidacionEnEdicion, archivoFile: file } }));
+    if (this._esSoloLectura()) {
+      return;
+    }
+
+    const archivos =
+      ev.target.files && ev.target.files.length > 0
+        ? (Array.prototype.slice.call(ev.target.files) as File[])
+        : [];
+    ev.target.value = '';
+
+    if (archivos.length === 0) {
+      return;
+    }
+
+    // Acumula pendientes; se suben al guardar (New y Edit).
+    this.setState(prev => {
+      const nombresPendientes = prev.liquidacionEnEdicion.archivosPendientes.map((file: File) =>
+        file.name.toLowerCase()
+      );
+      const nombresExistentes = prev.liquidacionArchivosExistentes.map((file: ILiquidacionAttachment) =>
+        file.fileName.toLowerCase()
+      );
+      const agregados: File[] = [];
+      const rechazados: string[] = [];
+      for (let i = 0; i < archivos.length; i++) {
+        const archivo = archivos[i];
+        const key = archivo.name.toLowerCase();
+        if (
+          nombresPendientes.indexOf(key) >= 0 ||
+          nombresExistentes.indexOf(key) >= 0 ||
+          agregados.some((f: File) => f.name.toLowerCase() === key)
+        ) {
+          rechazados.push(archivo.name);
+          continue;
+        }
+        agregados.push(archivo);
+        nombresPendientes.push(key);
+      }
+
+      if (rechazados.length > 0) {
+        this._setSectionError(
+          'liquidaciones',
+          'Ya hay archivos con el mismo nombre: ' + rechazados.join(', ') + '.'
+        );
+      } else {
+        this._clearSectionError('liquidaciones');
+      }
+
+      return {
+        liquidacionEnEdicion: {
+          ...prev.liquidacionEnEdicion,
+          archivosPendientes: prev.liquidacionEnEdicion.archivosPendientes.concat(agregados)
+        }
+      };
+    });
+  };
+
+  private _eliminarArchivoLiquidacionPendiente = (index: number): void => {
+    this.setState(prev => ({
+      liquidacionEnEdicion: {
+        ...prev.liquidacionEnEdicion,
+        archivosPendientes: prev.liquidacionEnEdicion.archivosPendientes.filter((_: File, i: number) => i !== index)
+      }
+    }));
+  };
+
+  private _eliminarArchivoLiquidacionExistente = async (fileName: string): Promise<void> => {
+    const itemId = this.state.liquidacionEnEdicionId;
+    if (this._esSoloLectura() || !itemId) {
+      return;
+    }
+
+    const confirmar = window.confirm('¿Desea eliminar el archivo "' + fileName + '"?');
+    if (!confirmar) {
+      return;
+    }
+
+    try {
+      this.setState({ liquidacionArchivosSubiendo: true, guardando: true });
+      this._clearSectionError('liquidaciones');
+      await this._service.deleteLiquidacionAttachment(itemId, fileName);
+      await this._refrescarArchivosLiquidacionEnEdicion(itemId);
+      if (this.state.viajeId) {
+        await this._refrescarLiquidaciones(this.state.viajeId);
+      }
+    } catch (error) {
+      this._setSectionError('liquidaciones', 'No se pudo eliminar el archivo "' + fileName + '".');
+    } finally {
+      this.setState({ liquidacionArchivosSubiendo: false, guardando: false });
+    }
   };
 
   private async _refrescarLiquidaciones(viajeId: number): Promise<void> {
@@ -2497,23 +2639,61 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     try {
       this.setState({ guardando: true });
       this._clearSectionError('liquidaciones');
+      const pendientes = this.state.liquidacionEnEdicion.archivosPendientes.slice();
       const data: ILiquidacionData = {
         viajeId,
         codigoReferencia: codigo,
         operadorId,
         monto,
-        moneda: this._normalizarMonedaLiquidacion(this.state.liquidacionEnEdicion.moneda),
-        file: this.state.liquidacionEnEdicion.archivoFile || undefined
+        moneda: this._normalizarMonedaLiquidacion(this.state.liquidacionEnEdicion.moneda)
       };
+
       if (this.state.liquidacionEnEdicionId) {
-        await this._service.updateLiquidacion(this.state.liquidacionEnEdicionId, data);
+        const itemId = this.state.liquidacionEnEdicionId;
+        // Orden Edit: 1) MERGE del ítem (mismo ID) 2) subir pendientes.
+        await this._service.updateLiquidacion(itemId, data);
+
+        const fallidos: string[] = [];
+        for (let i = 0; i < pendientes.length; i++) {
+          try {
+            await this._service.uploadLiquidacionAttachment(itemId, pendientes[i]);
+          } catch (uploadError) {
+            const detalle = uploadError instanceof Error && uploadError.message ? uploadError.message : pendientes[i].name;
+            fallidos.push(detalle);
+          }
+        }
+
+        await this._refrescarLiquidaciones(viajeId);
+
+        if (fallidos.length > 0) {
+          this.setState({ guardando: false });
+          this._setSectionError(
+            'liquidaciones',
+            'La liquidación se actualizó, pero no se pudieron adjuntar todos los archivos: ' + fallidos.join(' | ')
+          );
+          const archivos = await this._service.getLiquidacionAttachments(itemId);
+          this.setState({
+            liquidacionArchivosExistentes: archivos,
+            liquidacionEnEdicion: {
+              ...this.state.liquidacionEnEdicion,
+              archivosPendientes: []
+            }
+          });
+          return;
+        }
       } else {
-        await this._service.createLiquidacion(data);
+        // Orden New: 1) crear ítem 2) subir adjuntos con el ID generado.
+        await this._service.createLiquidacion({
+          ...data,
+          files: pendientes
+        });
+        await this._refrescarLiquidaciones(viajeId);
       }
-      await this._refrescarLiquidaciones(viajeId);
       this.setState({
         mostrarEditorLiquidacion: false,
-        liquidacionEnEdicion: { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivoFile: null },
+        liquidacionEnEdicion: this._estadoEditorLiquidacionVacio(),
+        liquidacionArchivosExistentes: [],
+        liquidacionArchivosSubiendo: false,
         liquidacionEnEdicionId: null,
         guardando: false
       });
@@ -2526,7 +2706,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
   private _cancelarLiquidacion = (): void => {
     this.setState({
       mostrarEditorLiquidacion: false,
-      liquidacionEnEdicion: { codigoReferencia: '', operadorId: '', monto: '', moneda: 'Pesos', archivoFile: null },
+      liquidacionEnEdicion: this._estadoEditorLiquidacionVacio(),
+      liquidacionArchivosExistentes: [],
+      liquidacionArchivosSubiendo: false,
       liquidacionEnEdicionId: null
     });
   };
@@ -3069,7 +3251,8 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
         const serviciosSincronizados = await this._sincronizarServiciosViaje(this.state.viajeId);
         const data = this._mapViajeData(pasajerosIdsResueltos, serviciosSincronizados);
         await this._service.updateViaje(this.state.viajeId, data);
-        this.props.onSave();
+        // Mantener el formulario de edición abierto (no volver al listado).
+        this.setState({ error: '' });
         return;
       }
 
@@ -3081,7 +3264,9 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       if (this.state.presupuestoArchivoPendiente) {
         await this._service.uploadPresupuesto(creado.id, this.state.presupuestoArchivoPendiente);
       }
-      this.props.onSave();
+      // Tras crear, abrir edición del mismo ítem (no volver al listado).
+      this._navegarAFormularioEdicion(creado.id);
+      return;
     } catch (error) {
       this.setState({ error: 'No se pudo guardar el viaje en "Registro de Viajes". Verifica lookup IDs.' });
     } finally {
@@ -3907,23 +4092,44 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                       <td style={layoutStyles.td}>{this._normalizarMonedaLiquidacion(l.moneda)}</td>
                       <td style={{ ...layoutStyles.td, textAlign: 'right' }}>{l.monto.toLocaleString('es-MX', { style: 'currency', currency: 'MXN' })}</td>
                       <td style={layoutStyles.td}>
-                        {l.archivoNombre && l.archivoUrl ? (
-                          <a
-                            href={l.archivoUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={liquidacionesStyles.archivoLink}
-                            title="Abrir / Descargar"
-                            onClick={e => {
-                              e.preventDefault();
-                              this._abrirLiquidacionArchivo(l.archivoUrl || '');
-                            }}
-                          >
-                            {l.archivoNombre}
-                          </a>
-                        ) : (
-                          <span style={{ ...liquidacionesStyles.archivoNombreEnTabla, color: '#605e5c' }}>—</span>
-                        )}
+                        {(() => {
+                          const archivosGrilla =
+                            l.archivos && l.archivos.length > 0
+                              ? l.archivos
+                              : l.archivoNombre
+                                ? [{ fileName: l.archivoNombre, serverRelativeUrl: l.archivoUrl || '' }]
+                                : [];
+                          if (archivosGrilla.length === 0) {
+                            return (
+                              <span style={{ ...liquidacionesStyles.archivoNombreEnTabla, color: '#605e5c' }}>—</span>
+                            );
+                          }
+                          return (
+                            <div>
+                              {archivosGrilla.map((archivo: ILiquidacionAttachment) => (
+                                <div key={archivo.fileName} style={{ marginBottom: 4 }}>
+                                  {archivo.serverRelativeUrl ? (
+                                    <a
+                                      href={archivo.serverRelativeUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      style={liquidacionesStyles.archivoLink}
+                                      title="Abrir / Descargar"
+                                      onClick={e => {
+                                        e.preventDefault();
+                                        this._abrirLiquidacionArchivo(archivo.serverRelativeUrl);
+                                      }}
+                                    >
+                                      {archivo.fileName}
+                                    </a>
+                                  ) : (
+                                    <span style={liquidacionesStyles.archivoNombreEnTabla}>{archivo.fileName}</span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })()}
                       </td>
                       {!soloLectura && (
                         <td style={{ ...layoutStyles.td, ...layoutStyles.actionsCell, paddingRight: 16 }}>
@@ -4011,19 +4217,94 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                       disabled={this.state.guardando}
                     />
                   </div>
-                  <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField }}>
-                    <label style={layoutStyles.label}>Archivo</label>
-                    <FileInputEspanol
-                      inputId="liquidacion-archivo"
-                      disabled={this.state.guardando}
-                      buttonLabel="Seleccionar archivo"
-                      onChange={this._onArchivoLiquidacionChange}
-                    />
-                    {this.state.liquidacionEnEdicion.archivoFile && (
-                      <div style={{ ...layoutStyles.fileInputHint, marginTop: 6 }}>
-                        Archivo a cargar: {this.state.liquidacionEnEdicion.archivoFile.name}
-                      </div>
-                    )}
+                  <div style={{ ...layoutStyles.fieldGroup, ...layoutStyles.inlineEditorField, flex: 1.4 }}>
+                    <label style={layoutStyles.label}>Archivos / comprobantes</label>
+                    <div style={layoutStyles.voucherAttachmentZone}>
+                      {this.state.liquidacionArchivosExistentes.length === 0 &&
+                        this.state.liquidacionEnEdicion.archivosPendientes.length === 0 &&
+                        !this.state.liquidacionArchivosSubiendo && (
+                          <div style={layoutStyles.voucherAttachmentEmpty}>No hay archivos adjuntos.</div>
+                        )}
+                      {this.state.liquidacionArchivosSubiendo && (
+                        <div style={{ ...layoutStyles.voucherAttachmentEmpty, padding: '12px 16px' }}>
+                          Adjuntando archivos...
+                        </div>
+                      )}
+                      {this.state.liquidacionArchivosExistentes.map((archivo: ILiquidacionAttachment, index: number) => {
+                        const esUltimo =
+                          index === this.state.liquidacionArchivosExistentes.length - 1 &&
+                          this.state.liquidacionEnEdicion.archivosPendientes.length === 0;
+                        return (
+                          <div
+                            key={'existente-' + archivo.fileName}
+                            style={
+                              esUltimo
+                                ? { ...layoutStyles.voucherAttachmentRow, ...layoutStyles.voucherAttachmentRowLast }
+                                : layoutStyles.voucherAttachmentRow
+                            }
+                          >
+                            <div style={layoutStyles.voucherAttachmentMeta}>
+                              <div style={layoutStyles.voucherAttachmentFileName}>{archivo.fileName}</div>
+                            </div>
+                            <div style={{ ...layoutStyles.voucherAttachmentActions, ...gridActionBarStyle }}>
+                              <GridIconActionButton
+                                title="Abrir / Descargar"
+                                onClick={() => this._abrirLiquidacionArchivo(archivo.serverRelativeUrl)}
+                                disabled={this.state.guardando || this.state.liquidacionArchivosSubiendo}
+                              >
+                                <GridIconDownload />
+                              </GridIconActionButton>
+                              {!!this.state.liquidacionEnEdicionId && (
+                                <GridIconActionButton
+                                  title="Eliminar"
+                                  onClick={() => { void this._eliminarArchivoLiquidacionExistente(archivo.fileName); }}
+                                  disabled={this.state.guardando || this.state.liquidacionArchivosSubiendo}
+                                >
+                                  <GridIconTrash />
+                                </GridIconActionButton>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {this.state.liquidacionEnEdicion.archivosPendientes.map((archivo: File, index: number) => {
+                        const esUltimo = index === this.state.liquidacionEnEdicion.archivosPendientes.length - 1;
+                        return (
+                          <div
+                            key={'pendiente-' + archivo.name + '-' + archivo.size + '-' + index}
+                            style={
+                              esUltimo
+                                ? { ...layoutStyles.voucherAttachmentRow, ...layoutStyles.voucherAttachmentRowLast }
+                                : layoutStyles.voucherAttachmentRow
+                            }
+                          >
+                            <div style={layoutStyles.voucherAttachmentMeta}>
+                              <div style={layoutStyles.voucherAttachmentFileName}>{archivo.name}</div>
+                              <div style={layoutStyles.fileInputHint}>Pendiente de guardar</div>
+                            </div>
+                            <div style={{ ...layoutStyles.voucherAttachmentActions, ...gridActionBarStyle }}>
+                              <GridIconActionButton
+                                title="Quitar"
+                                onClick={() => this._eliminarArchivoLiquidacionPendiente(index)}
+                                disabled={this.state.guardando || this.state.liquidacionArchivosSubiendo}
+                              >
+                                <GridIconTrash />
+                              </GridIconActionButton>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                      <FileInputEspanol
+                        inputId="liquidacion-archivo"
+                        multiple={true}
+                        disabled={this.state.guardando || this.state.liquidacionArchivosSubiendo}
+                        buttonLabel="Seleccionar archivos"
+                        hint="Los archivos se adjuntarán al guardar la liquidación."
+                        onChange={this._onArchivoLiquidacionChange}
+                      />
+                    </div>
                   </div>
                 </div>
                 <div>
@@ -4424,7 +4705,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
               <button
                 type="button"
                 style={layoutStyles.primaryButton}
-                onClick={this._navegarAFormularioEdicion}
+                onClick={() => this._navegarAFormularioEdicion()}
                 disabled={this.state.guardando || !this._getItemId()}
               >
                 Editar

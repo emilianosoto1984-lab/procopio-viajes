@@ -75,6 +75,11 @@ export interface IOperadorItem {
   titulo: string;
 }
 
+export interface ILiquidacionAttachment {
+  fileName: string;
+  serverRelativeUrl: string;
+}
+
 export interface ILiquidacionItem {
   id: number;
   codigoReferencia: string;
@@ -82,8 +87,10 @@ export interface ILiquidacionItem {
   moneda: string;
   operadorId?: number;
   operadorNombre?: string;
+  /** Primer adjunto (compatibilidad con la grilla). */
   archivoNombre?: string;
   archivoUrl?: string;
+  archivos?: ILiquidacionAttachment[];
 }
 
 export interface ILiquidacionData {
@@ -92,7 +99,9 @@ export interface ILiquidacionData {
   monto: number;
   moneda: string;
   operadorId: number;
+  /** @deprecated Preferir `files`. Se mantiene por compatibilidad. */
   file?: File;
+  files?: File[];
 }
 
 export interface IVoucherItem {
@@ -518,30 +527,72 @@ export default class SharePointViajesService {
     const map = await this._getLiquidacionesFieldMap();
     const lookupField = map.ViajeAsociado;
     const operadorLookup = map.Operador;
-    const selectFields = ['Id', 'Title', map.Monto, map.Moneda, lookupField + '/Id', operadorLookup + '/Id', operadorLookup + '/Title'];
+    const selectFields = [
+      'Id',
+      'Title',
+      map.Monto,
+      map.Moneda,
+      lookupField + '/Id',
+      operadorLookup + '/Id',
+      operadorLookup + '/Title'
+    ];
+    const expandFields = [lookupField, operadorLookup, 'AttachmentFiles'];
     const baseUrl =
       "/_api/web/lists/getByTitle('" +
       LISTA_LIQUIDACIONES +
       "')/items?$select=" +
       encodeURIComponent(selectFields.join(',')) +
       '&$expand=' +
-      encodeURIComponent(lookupField + ',' + operadorLookup);
+      encodeURIComponent(expandFields.join(','));
+    const baseUrlSinAttachments =
+      "/_api/web/lists/getByTitle('" +
+      LISTA_LIQUIDACIONES +
+      "')/items?$select=" +
+      encodeURIComponent(selectFields.join(',')) +
+      '&$expand=' +
+      encodeURIComponent([lookupField, operadorLookup].join(','));
 
     const lookupFilterUrl = this._buildUrl(baseUrl + '&$filter=' + encodeURIComponent(lookupField + '/Id eq ' + viajeId));
     let json: any;
     try {
       json = await this._get(lookupFilterUrl);
     } catch (error) {
-      const simpleFilterUrl = this._buildUrl(baseUrl + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId));
-      json = await this._get(simpleFilterUrl);
+      try {
+        const simpleFilterUrl = this._buildUrl(baseUrl + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId));
+        json = await this._get(simpleFilterUrl);
+      } catch (errorSinExpandAttachments) {
+        // Algunas listas rechazan $expand=AttachmentFiles; reintenta sin expand y usa endpoint dedicado.
+        try {
+          json = await this._get(
+            this._buildUrl(baseUrlSinAttachments + '&$filter=' + encodeURIComponent(lookupField + '/Id eq ' + viajeId))
+          );
+        } catch (errorLookup) {
+          json = await this._get(
+            this._buildUrl(baseUrlSinAttachments + '&$filter=' + encodeURIComponent(lookupField + ' eq ' + viajeId))
+          );
+        }
+      }
     }
 
     const values = this._getResults(json);
     const items: ILiquidacionItem[] = [];
     for (let i = 0; i < values.length; i++) {
       const item = values[i];
-      const id = item.Id as number;
-      const attachments = await this._getLiquidacionAttachments(id);
+      const id = Number(item.Id || item.ID || item.id) || 0;
+      if (id <= 0) {
+        continue;
+      }
+
+      let attachments = this._mapAttachmentFiles(item.AttachmentFiles, id);
+      // Fallback si $expand no devolvió adjuntos (o vino vacío por metadata).
+      if (attachments.length === 0) {
+        try {
+          attachments = await this.getLiquidacionAttachments(id);
+        } catch (attachError) {
+          attachments = [];
+        }
+      }
+
       items.push({
         id,
         codigoReferencia: this._getString(item, 'Title'),
@@ -550,7 +601,8 @@ export default class SharePointViajesService {
         operadorId: this._extractLookupId(item, operadorLookup) || undefined,
         operadorNombre: item[operadorLookup] ? this._getString(item[operadorLookup], 'Title') : undefined,
         archivoNombre: attachments.length > 0 ? attachments[0].fileName : undefined,
-        archivoUrl: attachments.length > 0 ? attachments[0].serverRelativeUrl : undefined
+        archivoUrl: attachments.length > 0 ? attachments[0].serverRelativeUrl : undefined,
+        archivos: attachments
       });
     }
     return items;
@@ -566,12 +618,18 @@ export default class SharePointViajesService {
     payload[map.Operador + 'Id'] = data.operadorId;
 
     const url = this._buildUrl("/_api/web/lists/getByTitle('" + LISTA_LIQUIDACIONES + "')/items");
-    const created = await this._post(url, payload);
-    const id = created.Id as number;
+    const created = await this._post(url, payload, {
+      Prefer: 'return=representation'
+    });
+    const id = this._extractCreatedItemId(created);
+    if (id <= 0) {
+      throw new Error('SharePoint no devolvió el ID de la liquidación creada.');
+    }
 
-    let archivoNombre: string | undefined;
-    if (data.file) {
-      archivoNombre = await this._addAttachmentToListItem(id, data.file);
+    const filesToUpload = this._resolveLiquidacionFilesToUpload(data);
+    const uploaded: ILiquidacionAttachment[] = [];
+    for (let i = 0; i < filesToUpload.length; i++) {
+      uploaded.push(await this.uploadLiquidacionAttachment(id, filesToUpload[i]));
     }
 
     return {
@@ -580,10 +638,17 @@ export default class SharePointViajesService {
       monto: data.monto,
       moneda: data.moneda,
       operadorId: data.operadorId,
-      archivoNombre
+      archivoNombre: uploaded.length > 0 ? uploaded[0].fileName : undefined,
+      archivoUrl: uploaded.length > 0 ? uploaded[0].serverRelativeUrl : undefined,
+      archivos: uploaded
     };
   }
 
+  /**
+   * Actualiza solo los campos del ítem. Los adjuntos se gestionan aparte
+   * (uploadLiquidacionAttachment / deleteLiquidacionAttachment), igual que en Registro de Pagos,
+   * para no tocar archivos existentes si el usuario no los modifica.
+   */
   public async updateLiquidacion(id: number, data: ILiquidacionData): Promise<void> {
     const map = await this._getLiquidacionesFieldMap();
     const payload: any = {};
@@ -596,6 +661,49 @@ export default class SharePointViajesService {
     const url = this._buildUrl("/_api/web/lists/getByTitle('" + LISTA_LIQUIDACIONES + "')/items(" + id + ')');
     await this._post(url, payload, {
       'X-HTTP-Method': 'MERGE',
+      'IF-MATCH': '*'
+    });
+  }
+
+  public async getLiquidacionAttachments(itemId: number): Promise<ILiquidacionAttachment[]> {
+    const url = this._buildLiquidacionAttachmentsUrl(itemId);
+    const json = await this._get(url);
+    return this._mapAttachmentFiles(this._getResults(json), itemId);
+  }
+
+  public async uploadLiquidacionAttachment(itemId: number, file: File): Promise<ILiquidacionAttachment> {
+    const fileName = this._sanitizeAttachmentFileName(file.name);
+    if (!fileName.trim()) {
+      throw new Error('El archivo no tiene un nombre válido.');
+    }
+
+    const existentes = await this.getLiquidacionAttachments(itemId);
+    const duplicado = existentes.some(
+      (attachment: ILiquidacionAttachment) => attachment.fileName.toLowerCase() === fileName.toLowerCase()
+    );
+    if (duplicado) {
+      throw new Error("Ya existe un archivo con el nombre '" + fileName + "'.");
+    }
+
+    await this._addAttachmentToListItem(itemId, file, fileName);
+
+    const actualizados = await this.getLiquidacionAttachments(itemId);
+    const subido = actualizados.filter(
+      (attachment: ILiquidacionAttachment) => attachment.fileName.toLowerCase() === fileName.toLowerCase()
+    )[0];
+    return (
+      subido ||
+      ({
+        fileName,
+        serverRelativeUrl: this._buildLiquidacionAttachmentFallbackUrl(itemId, fileName)
+      } as ILiquidacionAttachment)
+    );
+  }
+
+  public async deleteLiquidacionAttachment(itemId: number, fileName: string): Promise<void> {
+    const url = this._buildLiquidacionAttachmentItemUrl(itemId, fileName);
+    await this._post(url, undefined, {
+      'X-HTTP-Method': 'DELETE',
       'IF-MATCH': '*'
     });
   }
@@ -822,23 +930,100 @@ export default class SharePointViajesService {
     });
   }
 
-  private async _getLiquidacionAttachments(itemId: number): Promise<{ fileName: string; serverRelativeUrl: string }[]> {
-    const url = this._buildUrl(
+  private _buildLiquidacionAttachmentsUrl(itemId: number): string {
+    // Sin $select extra: FileNameAsPath/ServerRelativePath rompen el GET en algunos tenants.
+    return this._buildUrl(
       "/_api/web/lists/getByTitle('" + LISTA_LIQUIDACIONES + "')/items(" + itemId + ')/AttachmentFiles'
     );
-    const json = await this._get(url);
-    const files = this._getResults(json);
-    const attachments: { fileName: string; serverRelativeUrl: string }[] = [];
+  }
+
+  private _buildLiquidacionAttachmentItemUrl(itemId: number, fileName: string): string {
+    return this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_LIQUIDACIONES +
+        "')/items(" +
+        itemId +
+        ")/AttachmentFiles('" +
+        this._escapeODataFileName(fileName) +
+        "')"
+    );
+  }
+
+  private _buildLiquidacionAttachmentAddUrl(itemId: number, fileName: string): string {
+    // Mismo patrón que vouchers/pasajeros (sin encodeURIComponent dentro del literal OData).
+    return this._buildUrl(
+      "/_api/web/lists/getByTitle('" +
+        LISTA_LIQUIDACIONES +
+        "')/items(" +
+        itemId +
+        ")/AttachmentFiles/add(FileName='" +
+        this._escapeODataFileName(fileName) +
+        "')"
+    );
+  }
+
+  private _buildLiquidacionAttachmentFallbackUrl(itemId: number, fileName: string): string {
+    return (
+      this._webUrl.replace(/^https?:\/\/[^/]+/i, '') +
+      '/Lists/' +
+      LISTA_LIQUIDACIONES.replace(/ /g, '%20') +
+      '/Attachments/' +
+      itemId +
+      '/' +
+      encodeURIComponent(fileName)
+    );
+  }
+
+  private _extractCreatedItemId(created: any): number {
+    if (!created) {
+      return 0;
+    }
+    const raw = created.Id !== undefined ? created.Id : created.ID !== undefined ? created.ID : created.id;
+    const id = Number(raw);
+    return isNaN(id) ? 0 : id;
+  }
+
+  private _mapAttachmentFiles(raw: any, itemId: number): ILiquidacionAttachment[] {
+    const files = Array.isArray(raw)
+      ? raw
+      : raw && Array.isArray(raw.results)
+        ? raw.results
+        : raw && Array.isArray(raw.value)
+          ? raw.value
+          : [];
+
+    const attachments: ILiquidacionAttachment[] = [];
     for (let i = 0; i < files.length; i++) {
-      const fileName = this._getString(files[i], 'FileName');
-      if (fileName) {
-        attachments.push({
-          fileName,
-          serverRelativeUrl: this._getString(files[i], 'ServerRelativeUrl')
-        });
+      const file = files[i];
+      const fileName = this._getString(file, 'FileName') || this._getString(file, 'Name');
+      if (!fileName) {
+        continue;
       }
+
+      let serverRelativeUrl = this._getString(file, 'ServerRelativeUrl');
+      if (!serverRelativeUrl && file.ServerRelativePath) {
+        serverRelativeUrl = this._getString(file.ServerRelativePath, 'DecodedUrl');
+      }
+      if (!serverRelativeUrl) {
+        serverRelativeUrl = this._buildLiquidacionAttachmentFallbackUrl(itemId, fileName);
+      }
+
+      attachments.push({
+        fileName,
+        serverRelativeUrl
+      });
     }
     return attachments;
+  }
+
+  private _resolveLiquidacionFilesToUpload(data: ILiquidacionData): File[] {
+    if (data.files && data.files.length > 0) {
+      return data.files;
+    }
+    if (data.file) {
+      return [data.file];
+    }
+    return [];
   }
 
   private _escapeODataFileName(fileName: string): string {
@@ -853,8 +1038,10 @@ export default class SharePointViajesService {
     const ext = dot >= 0 ? trimmed.substring(dot) : '';
     base = base.replace(/[#%?&'"<>\\\/:*|]/g, '-');
     base = base.replace(/[\x00-\x1f]/g, '-');
+    // Espacios → _ para evitar URLs REST rotas en AttachmentFiles/add.
+    base = base.replace(/\s+/g, '_');
     base = base.replace(/-+/g, '-');
-    base = base.replace(/^[\s-]+|[\s-]+$/g, '');
+    base = base.replace(/^[\s_-]+|[\s_-]+$/g, '');
     if (!base) {
       base = 'documento';
     }
@@ -974,18 +1161,9 @@ export default class SharePointViajesService {
     await this._parseJsonResponse(response, 'POST', url);
   }
 
-  private async _addAttachmentToListItem(itemId: number, file: File): Promise<string> {
-    const name = this._sanitizeAttachmentFileName(file.name);
-    const escaped = this._escapeODataFileName(name);
-    const relativePath =
-      "/_api/web/lists/getByTitle('" +
-      LISTA_LIQUIDACIONES +
-      "')/items(" +
-      itemId +
-      ")/AttachmentFiles/add(FileName='" +
-      escaped +
-      "')";
-    const url = this._buildUrl(relativePath);
+  private async _addAttachmentToListItem(itemId: number, file: File, fileName?: string): Promise<string> {
+    const name = this._sanitizeAttachmentFileName(fileName || file.name);
+    const url = this._buildLiquidacionAttachmentAddUrl(itemId, name);
     const buffer = await file.arrayBuffer();
     const headers: ISPRequestHeaders = {
       Accept: 'application/json;odata.metadata=minimal',
