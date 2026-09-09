@@ -169,6 +169,8 @@ interface IProcopioFormsState {
   liquidacionEnEdicionId: number | null;
   cargando: boolean;
   guardando: boolean;
+  /** Feedback visual del guardado del viaje: vacío | en curso | ok. */
+  estadoGuardadoViaje: '' | 'guardando' | 'ok';
   error: string;
   sectionErrors: {
     pasajeros: string;
@@ -232,7 +234,45 @@ const layoutStyles: { [key: string]: React.CSSProperties } = {
   inlineEditor: { backgroundColor: '#faf9f8', borderRadius: 4, border: '1px dashed #c8c6c4', padding: 12, marginTop: 8 },
   inlineEditorRow: { display: 'flex', gap: 12, marginBottom: 8 },
   inlineEditorField: { flex: 1 },
-  bottomActions: { display: 'flex', justifyContent: 'flex-end', marginTop: 16 },
+  bottomActions: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 16, flexWrap: 'wrap' as const },
+  saveOverlay: {
+    position: 'fixed' as const,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255, 255, 255, 0.72)',
+    zIndex: 10000,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'all' as const
+  },
+  saveOverlayCard: {
+    minWidth: 260,
+    maxWidth: '90vw',
+    padding: '22px 28px',
+    borderRadius: 8,
+    border: '1px solid #c7e0f4',
+    backgroundColor: '#ffffff',
+    boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
+    textAlign: 'center' as const,
+    color: '#004578',
+    fontSize: 16,
+    fontWeight: 600,
+    lineHeight: 1.4
+  },
+  saveStatusOk: {
+    marginRight: 'auto',
+    padding: '8px 12px',
+    borderRadius: 4,
+    fontSize: 13.5,
+    fontWeight: 600,
+    lineHeight: 1.35,
+    backgroundColor: '#dff6dd',
+    border: '1px solid #bad80a',
+    color: '#0b6a0b'
+  },
   info: { marginBottom: 10, color: '#605e5c' },
   error: { color: '#a4262c', marginBottom: 10 },
   voucherAttachmentZone: {
@@ -933,6 +973,7 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       liquidacionEnEdicionId: null,
       cargando: true,
       guardando: false,
+      estadoGuardadoViaje: '',
       error: '',
       sectionErrors: {
         pasajeros: '',
@@ -1069,6 +1110,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       '&ID=' +
       itemId;
 
+    const listAny = this.props.context.list as any;
+    const rootFolder =
+      (listAny && (listAny.serverRelativeUrl || listAny.rootFolderUrl)) ||
+      '/Lists/Registro de Viajes';
+    // Relative to web if needed
+    const rootForQuery =
+      rootFolder.indexOf('/sites/') === 0 || rootFolder.indexOf('/Lists/') === 0
+        ? rootFolder.indexOf('/Lists/') === 0
+          ? this.props.context.pageContext.web.serverRelativeUrl.replace(/\/$/, '') + rootFolder
+          : rootFolder
+        : rootFolder;
+    url += '&RootFolder=' + encodeURIComponent(rootForQuery);
+
     // Conserva parámetros de debug SPFx si el form se abrió en modo local.
     try {
       const current = new URL(window.location.href);
@@ -1085,6 +1139,40 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     }
 
     window.location.assign(url);
+  };
+
+  /** Vuelve al listado de Registro de Viajes (más fiable que formSaved tras navegación manual). */
+  private _volverAlListadoViajes = (): void => {
+    const webUrl = this.props.context.pageContext.web.absoluteUrl.replace(/\/$/, '');
+    const origin = window.location.origin;
+    let listServerRelative = '';
+
+    try {
+      const rootFolder = new URL(window.location.href).searchParams.get('RootFolder');
+      if (rootFolder) {
+        listServerRelative = rootFolder;
+      }
+    } catch (error) {
+      // ignore
+    }
+
+    if (!listServerRelative) {
+      const listAny = this.props.context.list as any;
+      listServerRelative =
+        (listAny && (listAny.serverRelativeUrl || listAny.rootFolderUrl || listAny.RootFolderUrl)) || '';
+    }
+
+    if (listServerRelative) {
+      const absoluteListUrl =
+        listServerRelative.indexOf('http') === 0 ? listServerRelative : origin + listServerRelative;
+      const viewUrl = /AllItems\.aspx$/i.test(absoluteListUrl)
+        ? absoluteListUrl
+        : absoluteListUrl.replace(/\/$/, '') + '/AllItems.aspx';
+      window.location.assign(viewUrl);
+      return;
+    }
+
+    window.location.assign(webUrl + '/Lists/Registro%20de%20Viajes/AllItems.aspx');
   };
 
   private _getPasajeroDisplayUrl(pasajeroId: number): string {
@@ -3238,21 +3326,27 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
     }
   };
 
-  private _onGuardarViaje = async (): Promise<void> => {
+  private _onGuardarViaje = async (cerrarDespues: boolean = false): Promise<void> => {
     if (this._esSoloLectura()) { return; }
     if (!this._validarFechasViaje()) {
       return;
     }
     try {
-      this.setState({ guardando: true, error: '' });
+      this.setState({ guardando: true, error: '', estadoGuardadoViaje: 'guardando' });
       const pasajerosIdsResueltos = await this._resolverPasajerosIds();
 
       if (this.state.viajeId) {
         const serviciosSincronizados = await this._sincronizarServiciosViaje(this.state.viajeId);
         const data = this._mapViajeData(pasajerosIdsResueltos, serviciosSincronizados);
         await this._service.updateViaje(this.state.viajeId, data);
-        // Mantener el formulario de edición abierto (no volver al listado).
-        this.setState({ error: '' });
+        if (cerrarDespues) {
+          // Navegación explícita al listado: formSaved() no siempre vuelve
+          // cuando el Edit se abrió por redirect (p.ej. tras Crear viaje).
+          this._volverAlListadoViajes();
+        } else {
+          // Mantener el formulario de edición abierto (no volver al listado).
+          this.setState({ error: '', estadoGuardadoViaje: 'ok' });
+        }
         return;
       }
 
@@ -3268,13 +3362,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
       this._navegarAFormularioEdicion(creado.id);
       return;
     } catch (error) {
-      this.setState({ error: 'No se pudo guardar el viaje en "Registro de Viajes". Verifica lookup IDs.' });
+      this.setState({
+        error: 'No se pudo guardar el viaje en "Registro de Viajes". Verifica lookup IDs.',
+        estadoGuardadoViaje: ''
+      });
     } finally {
       this.setState({ guardando: false });
     }
   };
 
-  private _onCancelarViaje = (): void => this.props.onClose();
+  private _onCancelarViaje = (): void => {
+    // Misma navegación explícita por si el form se abrió fuera del panel.
+    this._volverAlListadoViajes();
+  };
 
   public render(): React.ReactElement<IProcopioFormsProps> {
     const soloLectura = this._esSoloLectura();
@@ -3312,6 +3412,19 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
 
     return (
       <div style={layoutStyles.page}>
+        {this.state.estadoGuardadoViaje === 'guardando' && (
+          <div
+            style={layoutStyles.saveOverlay}
+            role="alertdialog"
+            aria-busy="true"
+            aria-live="assertive"
+            aria-label="Guardando viaje"
+            onClick={e => { e.preventDefault(); e.stopPropagation(); }}
+            onMouseDown={e => { e.preventDefault(); e.stopPropagation(); }}
+          >
+            <div style={layoutStyles.saveOverlayCard}>Guardando viaje...</div>
+          </div>
+        )}
         <div style={layoutStyles.container}>
           <div style={layoutStyles.header}>
             <div style={layoutStyles.title}>Viaje</div>
@@ -4701,6 +4814,11 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
           </div>
 
           <div style={layoutStyles.bottomActions}>
+            {this.state.estadoGuardadoViaje === 'ok' && (
+              <div style={layoutStyles.saveStatusOk} role="status" aria-live="polite">
+                Viaje guardado correctamente.
+              </div>
+            )}
             {soloLectura ? (
               <button
                 type="button"
@@ -4711,9 +4829,26 @@ export default class ProcopioForms extends React.Component<IProcopioFormsProps, 
                 Editar
               </button>
             ) : (
-              <button type="button" style={layoutStyles.primaryButton} onClick={this._onGuardarViaje} disabled={this.state.guardando}>
-                {this.state.guardando ? 'Guardando...' : this.state.viajeId ? 'Guardar viaje' : 'Crear viaje'}
-              </button>
+              <>
+                <button
+                  type="button"
+                  style={layoutStyles.primaryButton}
+                  onClick={() => { void this._onGuardarViaje(false); }}
+                  disabled={this.state.guardando}
+                >
+                  {this.state.viajeId ? 'Guardar' : 'Crear viaje'}
+                </button>
+                {!!this.state.viajeId && (
+                  <button
+                    type="button"
+                    style={layoutStyles.defaultButton}
+                    onClick={() => { void this._onGuardarViaje(true); }}
+                    disabled={this.state.guardando}
+                  >
+                    Guardar y cerrar
+                  </button>
+                )}
+              </>
             )}
             <button type="button" style={layoutStyles.defaultButton} onClick={this._onCancelarViaje} disabled={this.state.guardando}>Cancelar</button>
           </div>
